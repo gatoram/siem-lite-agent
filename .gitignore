@@ -1,0 +1,10 @@
+# Секрети (ключі API, токен Telegram)
+.env
+
+# Локальна база історії по IP
+history.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/

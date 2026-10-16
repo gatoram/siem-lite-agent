@@ -1,2 +1,7 @@
 # Консольний вивід main.py
 rich>=13.7
+
+# AI-агент: Gemini API, AbuseIPDB, ключі з .env
+google-genai>=2.31
+requests>=2.32
+python-dotenv>=1.0

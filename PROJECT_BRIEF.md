@@ -55,9 +55,19 @@
    окрема функція, яка приймає список подій і повертає список інцидентів.
 
 4. **AI-агент-аналітик** (`agent.py`) — приймає інцидент (+ історію IP з
-   SQLite), викликає Claude API. Оголошений tool `check_ip_reputation`
-   (AbuseIPDB) — агент сам вирішує, коли його викликати. Повертає: тип
+   SQLite), викликає LLM. Оголошений tool `check_ip_reputation`
+   (AbuseIPDB) — агент сам вирішує, коли його викликати. Повертає JSON: тип
    загрози, severity (Low/Medium/High/Critical), пояснення, рекомендацію.
+
+   Аналітичний LLM — **Gemini API** (`google-genai`, безкоштовний тариф;
+   модель у константі `GEMINI_MODEL`). Провайдер змінний: спільний
+   інтерфейс `LLMProvider`, вибір через `LLM_PROVIDER` у `.env`; наступний
+   кандидат — Ollama (локальна модель). Режим `--dry-run` працює без
+   жодних API-викликів. Помилки 429/503 не валять програму — виклик
+   повторюється з паузою.
+
+   Запуск: `py -3 main.py batch sample_logs/auth.log sample_logs/access.log --ai`
+   (`--dry-run` — без API, `--rule brute_force` — лише одне правило).
 
 5. **Історія по IP** (SQLite, `history.db`) — кожна подія по IP
    зберігається, щоб агент бачив патерн поведінки за час, а не ізольовану
@@ -79,7 +89,7 @@
 ## Стек
 
 - Python 3.11+
-- `anthropic` SDK
+- `google-genai` (Gemini API — аналітичний LLM агента)
 - `pandas`
 - `sqlite3` (стандартна бібліотека)
 - `requests` (Telegram Bot API, AbuseIPDB)
@@ -88,6 +98,9 @@
 
 Залежності фіксуються в `requirements.txt` у міру того, як починають
 використовуватись у коді: `py -3 -m pip install -r requirements.txt`.
+
+Ключі — у `.env` (шаблон: `.env.example`): `LLM_PROVIDER`, `GEMINI_API_KEY`,
+`ABUSEIPDB_API_KEY`.
 
 ## Milestone-план
 

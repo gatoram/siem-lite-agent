@@ -34,3 +34,21 @@
   - Додано `.gitignore` (`.env`, `history.db`, `__pycache__/`), щоб ключі API і локальна база не потрапили в репозиторій.
   - Зроблено перший коміт проєкту.
 - Файли: `CLAUDE.md`, `NOTES.md`, `.gitignore` (створено)
+
+## [2026-10-16] Парсери SSH і web (компонент 2)
+- Промпт: Тепер зроби компонент 2 з PROJECT_BRIEF.md: parsers/ssh_parser.py і
+parsers/web_parser.py, що перетворюють рядки з sample_logs в уніфікований
+формат події з брифу. Врахуй те, що ти сам помітив: у syslog немає року,
+а URL у web-логах треба декодувати. Напиши простий тест, який парсить
+обидва файли і виводить кількість подій кожного event_type та 3 приклади
+розпарсених подій у JSON.
+- Що зроблено:
+  - `parsers/ssh_parser.py`: розпізнає `Accepted` → `login_success` і `Failed` → `login_fail`, у meta: user, invalid_user, auth_method, port, host, pid.
+  - `parsers/web_parser.py`: nginx combined → `http_request`, у meta: method, декодовані path/query/url, оригінальний `url_raw`, status_code, size, referer, user_agent.
+  - Обидва парсери мають однаковий інтерфейс `parse_line()` / `parse_file()`; нерозпізнаний рядок → `None`.
+  - `test_parsers.py`: результат 183 login_success, 47 login_fail (30 brute-force + 17 звичайних), 226 http_request; перевірки атак через assert пройшли.
+- Проблеми і як вирішено:
+  - Немає року в syslog: параметр `year`; якщо його не задано, підставляється поточний рік, а якщо дата виходить у майбутньому (грудневий лог, прочитаний у січні), береться попередній. Тест задає `year=2026` явно, щоб не залежати від дати запуску.
+  - URL-кодування: path декодується через `unquote`, query через `unquote_plus` (`+` = пробіл); оригінал лишається в `url_raw`.
+  - Часові пояси: web-час переводиться в UTC без tz, щоб формат timestamp збігався з SSH-подіями.
+- Файли: `parsers/__init__.py`, `parsers/ssh_parser.py`, `parsers/web_parser.py`, `test_parsers.py` (створено), `NOTES.md` (змінено)

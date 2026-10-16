@@ -27,6 +27,8 @@ from typing import Callable
 
 BRUTE_FORCE_MIN_FAILS = 10
 BRUTE_FORCE_WINDOW = timedelta(minutes=5)
+# Успішний вхід з того ж IP не пізніше ніж через стільки після серії = ймовірний злам
+BRUTE_FORCE_SUCCESS_WINDOW = timedelta(minutes=30)
 
 SCAN_MIN_UNIQUE_PATHS = 15
 SCAN_WINDOW = timedelta(minutes=5)
@@ -37,6 +39,7 @@ MAX_EXAMPLES = 3
 
 SEVERITY = {
     "brute_force": "High",
+    "brute_force_success": "Critical",   # brute-force, після якого вхід успішний
     "path_scanning": "Medium",
     "sqli": "High",
     "xss": "Medium",
@@ -106,14 +109,14 @@ def _find_bursts(events: list[dict], window: timedelta,
     return bursts
 
 
-def _make_incident(rule: str, events: list[dict], details: dict) -> dict:
+def _make_incident(rule: str, events: list[dict], details: dict, severity: str | None = None) -> dict:
     return {
         "rule": rule,
         "source_ip": events[0]["source_ip"],
         "first_seen": events[0]["timestamp"],
         "last_seen": events[-1]["timestamp"],
         "event_count": len(events),
-        "severity": SEVERITY[rule],
+        "severity": severity or SEVERITY[rule],
         "details": details,
         "examples": events[:MAX_EXAMPLES],
     }
@@ -125,15 +128,41 @@ def _match_patterns(text: str, patterns: dict[str, re.Pattern]) -> list[str]:
 
 # ------------------------------------------------------------------ правила
 
+def _success_after(burst: list[dict], successes: list[dict]) -> dict | None:
+    """Перший успішний вхід з того ж IP під час серії або до BRUTE_FORCE_SUCCESS_WINDOW після неї."""
+    start, end = _ts(burst[0]), _ts(burst[-1]) + BRUTE_FORCE_SUCCESS_WINDOW
+    return next((e for e in successes if start <= _ts(e) <= end), None)
+
+
 def brute_force(events: list[dict]) -> list[dict]:
-    """BRUTE_FORCE_MIN_FAILS+ невдалих логінів з одного IP за BRUTE_FORCE_WINDOW."""
-    fails = [e for e in events if e["event_type"] == "login_fail"]
+    """BRUTE_FORCE_MIN_FAILS+ невдалих логінів з одного IP за BRUTE_FORCE_WINDOW.
+
+    Якщо після серії з того ж IP був успішний вхід — severity Critical
+    (пароль, ймовірно, підібрано), а подія входу додається в інцидент.
+    """
+    logins = [e for e in events if e["event_type"] in ("login_fail", "login_success")]
     incidents = []
-    for ip_events in _group_by_ip(fails).values():
-        for burst in _find_bursts(ip_events, BRUTE_FORCE_WINDOW,
+    for ip_events in _group_by_ip(logins).values():
+        fails = [e for e in ip_events if e["event_type"] == "login_fail"]
+        successes = [e for e in ip_events if e["event_type"] == "login_success"]
+        for burst in _find_bursts(fails, BRUTE_FORCE_WINDOW,
                                   lambda w: len(w) >= BRUTE_FORCE_MIN_FAILS):
-            users = sorted({e["meta"].get("user") for e in burst} - {None})
-            incidents.append(_make_incident("brute_force", burst, {"targeted_users": users}))
+            details = {
+                "failed_attempts": len(burst),
+                "targeted_users": sorted({e["meta"].get("user") for e in burst} - {None}),
+                "login_success_after": False,
+            }
+            success = _success_after(burst, successes)
+            if success is None:
+                incidents.append(_make_incident("brute_force", burst, details))
+                continue
+            details["login_success_after"] = True
+            details["compromised_user"] = success["meta"].get("user")
+            details["success_time"] = success["timestamp"]
+            incident = _make_incident("brute_force", sorted(burst + [success], key=_ts), details,
+                                      severity=SEVERITY["brute_force_success"])
+            incident["examples"] = burst[:MAX_EXAMPLES - 1] + [success]  # вхід — найважливіший приклад
+            incidents.append(incident)
     return incidents
 
 

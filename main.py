@@ -10,6 +10,9 @@
   py -3 main.py batch sample_logs/*.log --ai --dry-run    # без реальних API-викликів
   py -3 main.py batch sample_logs/*.log --ai --rule brute_force
 
+Усі події пишуться в history.db (історія по IP); агент отримує зведення по IP
+разом з інцидентом.
+
 Формат кожного файлу (ssh / web) визначається автоматично за першими
 рядками, тому порядок аргументів не важливий.
 """
@@ -31,6 +34,7 @@ from rich.table import Table
 
 import agent
 import detector
+import history
 from parsers import ssh_parser, web_parser
 
 # Скільки перших непорожніх рядків дивитися, щоб визначити формат файлу
@@ -166,6 +170,18 @@ def severity_markup(severity: str) -> str:
     return f"[{style}]{severity}[/{style}]" if style else severity
 
 
+def format_history(summary: dict | None) -> str:
+    if not summary or not summary["total_events"]:
+        return "даних немає"
+    text = (f"подій {summary['total_events']}, невдалих входів {summary['login_fail']}, "
+            f"успішних {summary['login_success']}, {short_time(summary['first_seen'])} → "
+            f"{short_time(summary['last_seen'])}")
+    if detail := summary["success_after_failures_detail"]:
+        text += (f"\n  [bold red]успішний вхід {escape(str(detail['user']))} о {short_time(detail['success_time'])} "
+                 f"після {detail['failures_before']} невдалих поспіль[/bold red]")
+    return text
+
+
 def print_analysis(n: int, incident: dict, analysis: dict) -> None:
     """Ланцюжок: інцидент → tool calls → висновок.
 
@@ -175,6 +191,7 @@ def print_analysis(n: int, incident: dict, analysis: dict) -> None:
     lines = [
         f"[bold]Інцидент:[/bold] {incident['rule']} з {incident['source_ip']}, "
         f"подій: {incident['event_count']}, severity детектора: {severity_markup(incident['severity'])}",
+        f"[bold]Історія IP:[/bold] {format_history(analysis['ip_history'])}",
         "",
     ]
     if analysis["tool_calls"]:
@@ -187,7 +204,8 @@ def print_analysis(n: int, incident: dict, analysis: dict) -> None:
     lines += [
         "",
         f"[bold]Тип загрози:[/bold] {escape(analysis['threat_type'])}",
-        f"[bold]Severity (AI):[/bold] {severity_markup(analysis['severity'])}",
+        f"[bold]Severity (AI):[/bold] {severity_markup(analysis['severity'])}"
+        + (f" [bold yellow]⚠ {escape(analysis['severity_note'])}[/bold yellow]" if analysis.get("severity_note") else ""),
         f"[bold]Пояснення:[/bold] {escape(analysis['explanation'])}",
         f"[bold]Рекомендація:[/bold] {escape(analysis['recommendation'])}",
     ]
@@ -195,8 +213,8 @@ def print_analysis(n: int, incident: dict, analysis: dict) -> None:
     console.print(Panel("\n".join(lines), title=f"AI-аналіз #{n}", subtitle=model, title_align="left"))
 
 
-def run_ai(incidents: list[dict], dry_run: bool) -> list[dict]:
-    """Проганяє інциденти через агента; помилка на одному інциденті не зупиняє решту."""
+def run_ai(incidents: list[dict], dry_run: bool, db: history.History) -> list[dict]:
+    """Проганяє інциденти через агента (+ історія IP); помилка на одному інциденті не зупиняє решту."""
     try:
         provider = agent.get_provider(dry_run)
     except Exception as e:
@@ -207,7 +225,8 @@ def run_ai(incidents: list[dict], dry_run: bool) -> list[dict]:
     for n, incident in enumerate(incidents, 1):
         with console.status(f"AI-аналіз інциденту #{n} ({incident['rule']})..."):
             try:
-                analysis = agent.analyze_incident(incident, provider=provider, dry_run=dry_run)
+                analysis = agent.analyze_incident(incident, provider=provider, dry_run=dry_run,
+                                                  ip_history=db.ip_summary(incident["source_ip"]))
             except Exception as e:
                 console.print(f"[red]AI-аналіз #{n} не вдався: {type(e).__name__}: {e}[/red]")
                 continue
@@ -229,14 +248,18 @@ def run_batch(args: argparse.Namespace) -> int:
         incidents = [i for i in incidents if i["rule"] in args.rule]
 
     print_files(stats)
-    console.print()
-    print_incidents(incidents)
-
-    if args.ai or args.dry_run:
+    with history.History(args.history_db) as db:
+        added = db.store_events(events)
+        console.print(f"Історія IP ({args.history_db}): нових подій {added}, "
+                      f"вже були в базі {len(events) - added}")
         console.print()
-        analyses = run_ai(incidents, dry_run=args.dry_run)
-        console.print(f"\nAI-агент проаналізував {len(analyses)} з {len(incidents)} інцидентів"
-                      + (" [dim](dry-run)[/dim]" if args.dry_run else ""))
+        print_incidents(incidents)
+
+        if args.ai or args.dry_run:
+            console.print()
+            analyses = run_ai(incidents, dry_run=args.dry_run, db=db)
+            console.print(f"\nAI-агент проаналізував {len(analyses)} з {len(incidents)} інцидентів"
+                          + (" [dim](dry-run)[/dim]" if args.dry_run else ""))
 
     print_summary(events, incidents)
     return 0
@@ -252,6 +275,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="рік для syslog-логів без року (за замовчуванням — поточний)")
     batch.add_argument("--rule", action="append", choices=[r.__name__ for r in detector.RULES],
                        help="показувати лише інциденти цього правила (можна кілька разів)")
+    batch.add_argument("--history-db", type=Path, default=history.DEFAULT_DB,
+                       help="SQLite-база історії по IP (за замовчуванням history.db)")
     batch.add_argument("--ai", action="store_true", help="проаналізувати інциденти AI-агентом")
     batch.add_argument("--dry-run", action="store_true",
                        help="AI-агент без реальних API-викликів, з тестовою відповіддю (вмикає --ai)")

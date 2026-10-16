@@ -1,9 +1,14 @@
 """AI-агент-аналітик (компонент 4): аналізує інцидент від детектора.
 
-Агент отримує інцидент і має інструмент `check_ip_reputation` (AbuseIPDB).
-Чи викликати інструмент, вирішує сама модель. На виході JSON:
+Агент отримує інцидент разом зі зведенням історії IP з SQLite (history.py)
+і має інструмент `check_ip_reputation` (AbuseIPDB). Чи викликати інструмент,
+вирішує сама модель. На виході JSON:
   {"threat_type", "severity", "explanation", "recommendation"}
-+ службові поля: "tool_calls" (ланцюжок викликів), "provider", "model", "dry_run".
++ службові поля: "tool_calls" (ланцюжок викликів), "detector_severity",
+"model_severity", "severity_note", "ip_history", "provider", "model", "dry_run".
+
+Severity агента не може бути нижчою за severity детектора: якщо модель
+повертає нижчу, код залишає оцінку детектора і пише пояснення в severity_note.
 
 LLM-провайдер змінний: усі провайдери реалізують інтерфейс `LLMProvider`.
 Вибір через LLM_PROVIDER у .env (поки є лише "gemini"). Щоб додати Ollama,
@@ -56,17 +61,33 @@ ABUSEIPDB_FIELDS = [
 ]
 
 SYSTEM_PROMPT = """\
-Ти — досвідчений SOC-аналітик. Тобі надходить інцидент від rule-based детектора
-SIEM-системи: правило, що спрацювало, IP джерела, час, кількість подій,
-деталі та кілька прикладів сирих рядків логу.
+Ти — досвідчений SOC-аналітик. Тобі надходить JSON з двома частинами:
+  "incident"   — інцидент від rule-based детектора SIEM-системи: правило, IP
+                 джерела, час, кількість подій, деталі, приклади сирих рядків логу;
+  "ip_history" — зведення всіх подій цього IP з бази історії: скільки подій,
+                 невдалі й успішні входи, чи був успішний вхід після серії
+                 невдалих (success_after_failures), перша й остання поява.
 
 Оціни інцидент: що це за загроза, наскільки вона серйозна і що робити.
 У тебе є інструмент check_ip_reputation (AbuseIPDB). Викликай його, коли
-репутація IP може вплинути на оцінку; не викликай без потреби. Зважай, що для
-приватних і зарезервованих адрес AbuseIPDB даних про зловживання не має.
+репутація IP може вплинути на оцінку; не викликай без потреби.
 
-Severity, яку дав детектор, — лише попередня оцінка; можеш її змінити.
-Шкала: Low, Medium, High, Critical.
+Правила severity (шкала: Low, Medium, High, Critical):
+1. Поведінка з логів (incident та ip_history) важливіша за репутацію IP.
+2. Репутація може лише ПІДВИЩИТИ severity. Нульовий abuseConfidenceScore,
+   відсутність скарг, приватна чи зарезервована адреса (usageType "Reserved")
+   означають "немає даних про репутацію", а НЕ "IP безпечна". Це не причина
+   знижувати severity.
+3. Severity не може бути нижчою, ніж дав детектор (incident.severity).
+4. Якщо після серії невдалих входів був успішний вхід
+   (incident.details.login_success_after = true або
+   ip_history.success_after_failures = true) — це ймовірний злам облікового
+   запису, severity = Critical.
+
+Роби висновки ЛИШЕ з наданих даних (incident, ip_history, результат
+інструменту). Не вигадуй фактів, яких там немає. Якщо для якогось висновку
+даних немає (поле відсутнє, null, total_events = 0, інструмент повернув
+помилку), прямо пиши "даних немає", а не припускай.
 
 Фінальна відповідь — ЛИШЕ JSON-об'єкт без markdown, з полями:
   "threat_type": коротка назва загрози англійською (напр. "SSH brute-force"),
@@ -286,13 +307,18 @@ class DryRunProvider(LLMProvider):
     }
 
     def run(self, system_prompt: str, user_prompt: str, tools: list[Tool], trace: list[dict]) -> str:
-        incident = json.loads(user_prompt.split("\n", 1)[1])
+        payload = json.loads(user_prompt.split("\n", 1)[1])
+        incident, history = payload["incident"], payload["ip_history"] or {}
         reputation = self.call_tool(tools, "check_ip_reputation", {"ip": incident["source_ip"]}, trace)
         threat_type, recommendation = self.CANNED.get(
             incident["rule"], ("Suspicious activity", "Перевірити активність IP вручну."))
+        severity = incident["severity"]
+        if incident["details"].get("login_success_after") or history.get("success_after_failures"):
+            threat_type, severity = "SSH brute-force with successful login", "Critical"
+            recommendation = "Ізолювати хост, заблокувати IP, змінити пароль скомпрометованого облікового запису."
         return json.dumps({
             "threat_type": threat_type,
-            "severity": incident["severity"],
+            "severity": severity,
             "explanation": (f"[dry-run] Правило {incident['rule']} спрацювало на {incident['event_count']} подіях "
                             f"з {incident['source_ip']}; abuseConfidenceScore = {reputation.get('abuseConfidenceScore')}."),
             "recommendation": recommendation,
@@ -317,9 +343,25 @@ def get_provider(dry_run: bool = False) -> LLMProvider:
 
 # ------------------------------------------------------------------ агент
 
-def build_user_prompt(incident: dict) -> str:
-    # Перший рядок — інструкція, далі інцидент у JSON (DryRunProvider на це спирається)
-    return "Проаналізуй інцидент:\n" + json.dumps(incident, ensure_ascii=False, indent=2)
+def build_user_prompt(incident: dict, ip_history: dict | None) -> str:
+    # Перший рядок — інструкція, далі JSON (DryRunProvider на це спирається)
+    payload = {"incident": incident, "ip_history": ip_history}
+    return "Проаналізуй інцидент:\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def apply_severity_floor(verdict: dict, detector_severity: str) -> dict:
+    """Не дає агенту поставити severity нижче за детектор; позначає такий випадок."""
+    model_severity = verdict["severity"]
+    verdict["model_severity"] = model_severity
+    verdict["detector_severity"] = detector_severity
+    verdict["severity_note"] = None
+    if SEVERITIES.index(model_severity) < SEVERITIES.index(detector_severity):
+        log.warning("Модель поставила %s нижче за детектор (%s) — залишаю %s",
+                    model_severity, detector_severity, detector_severity)
+        verdict["severity"] = detector_severity
+        verdict["severity_note"] = (f"модель запропонувала {model_severity}, що нижче за оцінку "
+                                    f"детектора; залишено {detector_severity}")
+    return verdict
 
 
 def parse_verdict(text: str, fallback_severity: str) -> dict:
@@ -342,14 +384,17 @@ def parse_verdict(text: str, fallback_severity: str) -> dict:
     }
 
 
-def analyze_incident(incident: dict, provider: LLMProvider | None = None, dry_run: bool = False) -> dict:
-    """Аналізує один інцидент. Повертає вердикт + ланцюжок tool calls."""
+def analyze_incident(incident: dict, provider: LLMProvider | None = None, dry_run: bool = False,
+                     ip_history: dict | None = None) -> dict:
+    """Аналізує один інцидент (+ зведення історії IP). Повертає вердикт + ланцюжок tool calls."""
     provider = provider or get_provider(dry_run)
     trace: list[dict] = []
-    text = provider.run(SYSTEM_PROMPT, build_user_prompt(incident), make_tools(dry_run), trace)
+    text = provider.run(SYSTEM_PROMPT, build_user_prompt(incident, ip_history), make_tools(dry_run), trace)
     verdict = parse_verdict(text, fallback_severity=incident["severity"])
+    verdict = apply_severity_floor(verdict, incident["severity"])
     return {
         **verdict,
+        "ip_history": ip_history,
         "tool_calls": trace,
         "provider": provider.name,
         "model": provider.model,

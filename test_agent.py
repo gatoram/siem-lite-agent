@@ -2,8 +2,9 @@
 
 Запуск: py -3 test_agent.py
 
-Перевіряє: dry-run на інцидентах із sample_logs, повтор після 429/503,
-розбір JSON-відповіді моделі та цикл tool use через фейкового провайдера.
+Перевіряє: dry-run на інцидентах із sample_logs (з історією IP), повтор
+після 429/503, розбір JSON-відповіді моделі, цикл tool use через фейкового
+провайдера і те, що агент не може поставити severity нижче за детектор.
 """
 
 import json
@@ -14,15 +15,27 @@ import requests
 
 import agent
 import detector
+import history
 from parsers import ssh_parser, web_parser
 
 LOGS_DIR = Path(__file__).parent / "sample_logs"
 
 
-def load_incidents() -> list[dict]:
-    events = (ssh_parser.parse_file(LOGS_DIR / "auth.log", year=2026)
-              + web_parser.parse_file(LOGS_DIR / "access.log"))
-    return detector.detect(events)
+def load_events() -> list[dict]:
+    return (ssh_parser.parse_file(LOGS_DIR / "auth.log", year=2026)
+            + web_parser.parse_file(LOGS_DIR / "access.log"))
+
+
+class FixedProvider(agent.LLMProvider):
+    """Фейковий провайдер, що завжди повертає задану severity без виклику інструментів."""
+
+    name = model = "fixed"
+
+    def __init__(self, severity: str):
+        self.severity = severity
+
+    def run(self, system_prompt, user_prompt, tools, trace):
+        return json.dumps({"threat_type": "X", "severity": self.severity, "explanation": "e", "recommendation": "r"})
 
 
 class ScriptedProvider(agent.LLMProvider):
@@ -44,10 +57,16 @@ def main() -> None:
         raise AssertionError("dry-run не має ходити в мережу")
     requests.get = requests.post = no_network
 
-    # --- dry-run на всіх інцидентах ---
-    incidents = load_incidents()
+    # --- dry-run на всіх інцидентах, з історією IP ---
+    events = load_events()
+    incidents = detector.detect(events)
+    db = history.History(":memory:")
+    db.store_events(events)
+    results = {}
     for incident in incidents:
-        result = agent.analyze_incident(incident, dry_run=True)
+        result = agent.analyze_incident(incident, dry_run=True, ip_history=db.ip_summary(incident["source_ip"]))
+        results[(incident["rule"], incident["source_ip"])] = result
+        assert result["ip_history"]["ip"] == incident["source_ip"]
         assert set(result) >= {"threat_type", "severity", "explanation", "recommendation", "tool_calls"}
         assert result["severity"] in agent.SEVERITIES
         assert result["dry_run"] and result["provider"] == "dry-run"
@@ -55,6 +74,22 @@ def main() -> None:
         assert result["tool_calls"][0]["args"] == {"ip": incident["source_ip"]}
     print("dry-run, приклад відповіді:")
     print(json.dumps(result, ensure_ascii=False, indent=2))
+
+    # Два brute-force: без успіху — High, з успішним входом — Critical
+    assert results[("brute_force", "203.0.113.45")]["severity"] == "High"
+    assert results[("brute_force", "203.0.113.77")]["severity"] == "Critical"
+
+    # В історію IP і в промпт потрапляє ознака успішного brute-force
+    prompt = agent.build_user_prompt(incidents[0], db.ip_summary("203.0.113.77"))
+    assert '"success_after_failures": true' in prompt
+
+    # --- severity не нижче за детектор ---
+    plain_bf = next(i for i in incidents if i["source_ip"] == "203.0.113.45")
+    lowered = agent.analyze_incident(plain_bf, provider=FixedProvider("Medium"), dry_run=True)
+    assert lowered["severity"] == "High" and lowered["model_severity"] == "Medium"
+    assert lowered["severity_note"] and "Medium" in lowered["severity_note"]
+    raised = agent.analyze_incident(plain_bf, provider=FixedProvider("Critical"), dry_run=True)
+    assert raised["severity"] == "Critical" and raised["severity_note"] is None
 
     # --- повтор після 429 / 503 ---
     sleeps = []

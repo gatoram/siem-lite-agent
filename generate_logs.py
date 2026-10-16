@@ -1,8 +1,10 @@
 """Генератор синтетичних логів для розробки й демо SIEM-lite.
 
 Створює:
-  sample_logs/auth.log   — ~200 нормальних SSH-подій + brute-force атака
-                           (30 невдалих спроб за 2 хвилини з одного IP)
+  sample_logs/auth.log   — ~200 нормальних SSH-подій + дві brute-force атаки:
+                           1) 30 невдалих спроб за 2 хвилини, усі невдалі;
+                           2) з іншого IP: 25 невдалих спроб, після яких
+                              вхід успішний (зламаний пароль admin)
   sample_logs/access.log — ~200 нормальних web-запитів (nginx combined)
                            + сканування шляхів + SQLi-спроба в параметрі
 
@@ -34,6 +36,12 @@ SSH_USERS = {
 
 BRUTE_FORCE_IP = "203.0.113.45"
 BRUTE_FORCE_USERS = ["root", "admin", "test", "ubuntu", "oracle", "postgres", "user", "guest"]
+
+# Другий сценарій: brute-force, що завершився успішним входом
+COMPROMISE_IP = "203.0.113.77"
+COMPROMISE_USERS = ["admin", "root", "admin", "administrator", "admin"]  # переважно admin
+COMPROMISE_FAILS = 25
+COMPROMISE_START = datetime(2026, 9, 30, 21, 10, 0)
 
 WEB_CLIENT_IPS = [
     "10.0.1.15", "10.0.1.22", "198.51.100.7", "198.51.100.23", "198.51.100.88",
@@ -112,6 +120,27 @@ def generate_auth_log(rng: random.Random) -> list[tuple[datetime, str]]:
             msg = f"Failed password for invalid user {user} from {BRUTE_FORCE_IP} port {port} ssh2"
         entries.append((ts, ssh_line(ts, pid, msg)))
 
+    entries += generate_compromise(random.Random(SEED + 1))
+    return entries
+
+
+def generate_compromise(rng: random.Random) -> list[tuple[datetime, str]]:
+    """Brute-force з COMPROMISE_IP: COMPROMISE_FAILS невдалих спроб за ~1.5 хв, потім успішний вхід admin.
+
+    Окремий rng, щоб додавання сценарію не змінило решту згенерованих логів.
+    """
+    entries = []
+    offsets = sorted(rng.sample(range(0, 90), COMPROMISE_FAILS))
+    for offset in offsets:
+        ts = COMPROMISE_START + timedelta(seconds=offset)
+        user = rng.choice(COMPROMISE_USERS)
+        invalid = "" if user in SSH_USERS else "invalid user "
+        msg = f"Failed password for {invalid}{user} from {COMPROMISE_IP} port {rng.randint(40000, 65000)} ssh2"
+        entries.append((ts, ssh_line(ts, rng.randint(1000, 30000), msg)))
+
+    ts = COMPROMISE_START + timedelta(seconds=offsets[-1] + 4)
+    msg = f"Accepted password for admin from {COMPROMISE_IP} port {rng.randint(40000, 65000)} ssh2"
+    entries.append((ts, ssh_line(ts, rng.randint(1000, 30000), msg)))
     return entries
 
 

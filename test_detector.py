@@ -4,7 +4,8 @@
 (спочатку згенеруй логи: py -3 generate_logs.py)
 
 Проганяє обидва лог-файли через парсери і детектор, виводить інциденти
-і перевіряє, що знайдено рівно три вкраплені атаки без хибних спрацювань.
+і перевіряє, що знайдено рівно чотири вкраплені атаки без хибних спрацювань,
+а два brute-force (без успіху і з успішним входом) розрізняються.
 """
 
 import sys
@@ -16,8 +17,12 @@ from parsers import ssh_parser, web_parser
 LOGS_DIR = Path(__file__).parent / "sample_logs"
 LOG_YEAR = 2026
 
+BRUTE_FORCE_IP = "203.0.113.45"   # лише невдалі спроби
+COMPROMISE_IP = "203.0.113.77"    # невдалі спроби, потім успішний вхід
+
 EXPECTED = {
-    ("brute_force", "203.0.113.45"),
+    ("brute_force", BRUTE_FORCE_IP),
+    ("brute_force", COMPROMISE_IP),
     ("path_scanning", "198.51.100.200"),
     ("sqli", "192.0.2.66"),
 }
@@ -53,19 +58,35 @@ def main() -> None:
     for incident in incidents:
         print_incident(incident)
 
-    # --- Рівно три очікувані інциденти ---
+    # --- Рівно чотири очікувані інциденти ---
     found = {(i["rule"], i["source_ip"]) for i in incidents}
-    assert len(incidents) == 3, f"очікувалось 3 інциденти, знайдено {len(incidents)}"
+    assert len(incidents) == 4, f"очікувалось 4 інциденти, знайдено {len(incidents)}"
     assert found == EXPECTED, f"неочікувані інциденти: {found ^ EXPECTED}"
 
-    by_rule = {i["rule"]: i for i in incidents}
-    assert by_rule["brute_force"]["event_count"] == 30
+    by_rule = {i["rule"]: i for i in incidents if i["source_ip"] != COMPROMISE_IP}
+    by_ip = {i["source_ip"]: i for i in incidents}
+
+    # --- Два brute-force розрізняються ---
+    plain, compromise = by_ip[BRUTE_FORCE_IP], by_ip[COMPROMISE_IP]
+    assert plain["event_count"] == 30 and plain["severity"] == "High"
+    assert plain["details"]["login_success_after"] is False
+    assert compromise["severity"] == "Critical"
+    assert compromise["details"]["login_success_after"] is True
+    assert compromise["details"]["failed_attempts"] == 25
+    assert compromise["details"]["compromised_user"] == "admin"
+    assert compromise["examples"][-1]["event_type"] == "login_success"
+    assert compromise["last_seen"] == compromise["details"]["success_time"]
+
+    # Успішний вхід через годину після серії — вже не "одразу після" → High
+    late = dict(compromise["examples"][-1], timestamp="2026-09-30T22:30:00")
+    burst = [e for e in events if e["source_ip"] == COMPROMISE_IP and e["event_type"] == "login_fail"]
+    assert detector.brute_force(burst + [late])[0]["severity"] == "High"
     assert by_rule["path_scanning"]["details"]["unique_paths"] == 25
     assert "or_tautology" in by_rule["sqli"]["details"]["matched_patterns"]
 
     # --- Звичайні невдалі входи не дають хибних спрацювань ---
     normal_fails = [e for e in events
-                    if e["event_type"] == "login_fail" and e["source_ip"] != "203.0.113.45"]
+                    if e["event_type"] == "login_fail" and e["source_ip"] not in (BRUTE_FORCE_IP, COMPROMISE_IP)]
     assert normal_fails, "у логах мають бути звичайні невдалі входи"
     assert detector.brute_force(normal_fails) == []
 

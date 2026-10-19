@@ -8,6 +8,9 @@
 Дублікати не надсилаються: інцидент ідентифікується за (IP, правило, час
 першої події) і після успішної відправки записується в таблицю `notifications`
 тієї ж SQLite-бази, що й історія IP, — тому повторний запуск його не повторить.
+Виняток — ескалація: якщо той самий інцидент згодом отримав вищу severity
+(у live-режимі brute-force спершу High, а після успішного входу — Critical),
+сповіщення надсилається ще раз з новою severity.
 
 Ключі з .env: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID.
 
@@ -124,14 +127,18 @@ class SentLog:
         self.conn = conn
         self.conn.executescript(SCHEMA)
 
-    def was_sent(self, incident: dict) -> bool:
-        return self.conn.execute(
-            "SELECT 1 FROM notifications WHERE source_ip = ? AND rule = ? AND first_seen = ?",
-            incident_key(incident)).fetchone() is not None
+    def was_sent(self, incident: dict, severity: str | None = None) -> bool:
+        """Чи надсилався інцидент; з severity — чи надсилався з такою або вищою severity."""
+        row = self.conn.execute(
+            "SELECT severity FROM notifications WHERE source_ip = ? AND rule = ? AND first_seen = ?",
+            incident_key(incident)).fetchone()
+        if row is None or severity is None:
+            return row is not None
+        return row[0] in SEVERITIES and SEVERITIES.index(row[0]) >= SEVERITIES.index(severity)
 
     def mark_sent(self, incident: dict, severity: str) -> None:
         self.conn.execute(
-            "INSERT OR IGNORE INTO notifications (source_ip, rule, first_seen, severity, sent_at) "
+            "INSERT OR REPLACE INTO notifications (source_ip, rule, first_seen, severity, sent_at) "
             "VALUES (?, ?, ?, ?, ?)",
             (*incident_key(incident), severity, datetime.now(timezone.utc).isoformat(timespec="seconds")))
         self.conn.commit()
@@ -194,7 +201,7 @@ def notify(incidents: list[tuple[dict, dict | None]], sent_log: SentLog, dry_run
         if not should_notify(severity):
             stats["below_threshold"] += 1
             continue
-        if sent_log.was_sent(incident):
+        if sent_log.was_sent(incident, severity):
             stats["duplicate"] += 1
             continue
         text = format_message(incident, analysis)

@@ -111,6 +111,16 @@ def main() -> None:
             stats = notifier.notify([(later, None)], notifier.SentLog(conn), notifier=tg)
         assert stats["sent"] == 1 and len(sent_texts) == 2
 
+        # Ескалація: той самий інцидент спершу High, потім Critical — друге сповіщення;
+        # повтор Critical або знову High — дублікат
+        early = {**INCIDENT, "first_seen": "2026-10-02T09:00:00", "severity": "High"}
+        for incident, expected_sent in [(early, 1), ({**early, "severity": "Critical"}, 1),
+                                        ({**early, "severity": "Critical"}, 0), (early, 0)]:
+            with closing(sqlite3.connect(db_path)) as conn:
+                stats = notifier.notify([(incident, None)], notifier.SentLog(conn), notifier=tg)
+            assert stats["sent"] == expected_sent, (incident["severity"], stats)
+        assert "CRITICAL" in sent_texts[-1] and len(sent_texts) == 4
+
     # Без токена — попередження, не падіння
     empty = notifier.TelegramNotifier(token="", chat_id="")
     empty.token = empty.chat_id = ""

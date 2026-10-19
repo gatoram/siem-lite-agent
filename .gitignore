@@ -8,3 +8,6 @@ history.db
 __pycache__/
 *.pyc
 .venv/
+
+# Логи симулятора атаки (simulate_attack.py) для демо live-режиму
+live_logs/

@@ -2,7 +2,7 @@
 
 Режими:
   batch — одноразовий прогін готових лог-файлів (для тестування й демо)
-  live  — стеження за логами в реальному часі (буде додано пізніше)
+  live  — стеження за логами в реальному часі (як tail -f, з кінця файлів)
 
 Приклад:
   py -3 main.py batch sample_logs/auth.log sample_logs/access.log
@@ -12,6 +12,8 @@
   py -3 main.py batch real_logs/OpenSSH_2k.log --ai --max-ai 3   # лише 3 найсерйозніші
   py -3 main.py batch sample_logs/*.log --notify --dry-run        # сповіщення в консоль, не в Telegram
   py -3 main.py batch sample_logs/*.log --ai --notify --ip 203.0.113.77
+  py -3 main.py live live_logs/auth.log live_logs/access.log --dry-run --notify
+  py -3 main.py live live_logs/*.log --ai --notify               # Ctrl+C — зупинка з підсумком
 
 Усі події пишуться в history.db (історія по IP); агент отримує зведення по IP
 разом з інцидентом. З --notify інциденти High/Critical надсилаються в Telegram
@@ -19,6 +21,12 @@
 
 Формат кожного файлу (ssh / web) визначається автоматично за першими
 рядками, тому порядок аргументів не важливий.
+
+У live нові рядки парсяться, пишуться в history.db, а детектор щоразу
+працює по ковзному вікну останніх подій (live.WINDOW). Кожен новий інцидент
+(IP + правило + first_seen) AI-агент аналізує один раз, хоч би скільки атака
+ще тривала; повторно — лише якщо severity детектора зросла (brute-force, після
+якого вхід успішний: High → Critical).
 """
 
 import argparse
@@ -27,6 +35,8 @@ import json
 import logging
 import re
 import sys
+import time
+from datetime import datetime
 from functools import partial
 from itertools import islice
 from pathlib import Path
@@ -41,6 +51,7 @@ from rich.table import Table
 import agent
 import detector
 import history
+import live
 import notifier
 from parsers import ssh_parser, web_parser
 
@@ -157,7 +168,7 @@ def print_incidents(incidents: list[dict]) -> None:
     console.print(table)
 
 
-def print_summary(events: list[dict], incidents: list[dict]) -> None:
+def print_summary(event_count: int, incidents: list[dict]) -> None:
     by_severity = {}
     for inc in incidents:
         by_severity[inc["severity"]] = by_severity.get(inc["severity"], 0) + 1
@@ -166,7 +177,7 @@ def print_summary(events: list[dict], incidents: list[dict]) -> None:
         for sev, count in sorted(by_severity.items(), key=lambda kv: list(SEVERITY_STYLE).index(kv[0]))
     )
     console.print(
-        f"\n[bold]Підсумок:[/bold] оброблено подій: [bold]{len(events)}[/bold], "
+        f"\n[bold]Підсумок:[/bold] оброблено подій: [bold]{event_count}[/bold], "
         f"знайдено інцидентів: [bold]{len(incidents)}[/bold]"
         + (f" ({breakdown})" if breakdown else "")
     )
@@ -318,7 +329,172 @@ def run_batch(args: argparse.Namespace) -> int:
             console.print()
             run_notify(incidents, analyses, dry_run=args.dry_run, db=db)
 
-    print_summary(events, incidents)
+    print_summary(len(events), incidents)
+    return 0
+
+
+# ------------------------------------------------------------------ live
+
+# Як часто перевіряти файли на нові рядки
+LIVE_POLL_SECONDS = 0.5
+# Без інтерактивного терміналу (вивід у файл) рядок статусу друкується раз на стільки секунд
+LIVE_STATUS_EVERY = 10
+
+
+def clock() -> str:
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def print_detector_panel(n: int, incident: dict) -> None:
+    """Панель нового інциденту без AI-аналізу — дані детектора."""
+    details = format_details(incident["details"]).replace("\n", "; ")
+    lines = [
+        f"[bold]Правило:[/bold] {incident['rule']}   [bold]IP:[/bold] {incident['source_ip']}   "
+        f"[bold]Severity:[/bold] {severity_markup(incident['severity'])}",
+        f"[bold]Подій:[/bold] {incident['event_count']}   "
+        f"[bold]Час:[/bold] {short_time(incident['first_seen'])} → {short_time(incident['last_seen'])}",
+        f"[bold]Деталі:[/bold] {escape(details)}",
+    ]
+    console.print(Panel("\n".join(lines), title=f"Інцидент #{n} (детектор)", title_align="left"))
+
+
+class LiveSession:
+    """Стан main.py live і реакція на нові інциденти: AI-аналіз, Telegram, лічильники."""
+
+    def __init__(self, args: argparse.Namespace, db: history.History):
+        self.args, self.db = args, db
+        self.started = time.monotonic()
+        parsers = get_parsers(args.year)
+        self.sources = [live.LiveSource(p, parsers, detect_format) for p in args.logs]
+        self.window = live.EventWindow()
+        self.tracker = live.IncidentTracker()
+        self.ai_done = 0
+        self.notify_stats = dict.fromkeys(["sent", "dry_run", "duplicate", "failed", "below_threshold"], 0)
+
+        self.provider = None
+        if args.ai or args.dry_run:
+            try:
+                self.provider = agent.get_provider(args.dry_run)
+            except Exception as e:
+                console.print(f"[red]AI-агент недоступний, далі лише детектор: {e}[/red]")
+        self.sent_log = notifier.SentLog(db.conn) if args.notify else None
+        self.telegram = notifier.TelegramNotifier() if args.notify and not args.dry_run else None
+
+    def poll(self) -> int:
+        """Один прохід: нові рядки → history.db → детектор по вікну → реакція. Повертає кількість подій."""
+        events = [event for source in self.sources for event in source.poll()]
+        if not events:
+            return 0
+        self.db.store_events(events)
+        self.window.add(events)
+        for n, incident, kind in self.tracker.update(detector.detect(self.window.events)):
+            self.on_incident(n, incident, kind)
+        return len(events)
+
+    def on_incident(self, n: int, incident: dict, kind: str) -> None:
+        label = "[bold]Новий інцидент[/bold]" if kind == "new" else "[bold yellow]Ескалація[/bold yellow]"
+        console.print(f"\n[dim]{clock()}[/dim] {label} #{n}: {severity_markup(incident['severity'])} "
+                      f"{incident['rule']} з {incident['source_ip']}, подій {incident['event_count']}, "
+                      f"початок {short_time(incident['first_seen'])}")
+
+        analysis = None
+        if self.provider is not None:
+            if self.args.max_ai is not None and self.ai_done >= self.args.max_ai:
+                console.print(f"[dim]--max-ai {self.args.max_ai}: ліміт AI-аналізів сесії вичерпано[/dim]")
+            else:
+                analysis = self.analyze(n, incident)
+        if analysis is None:
+            print_detector_panel(n, incident)
+
+        if self.sent_log is not None:
+            stats = notifier.notify([(incident, analysis)], self.sent_log, dry_run=self.args.dry_run,
+                                    notifier=self.telegram, print_message=print_telegram_message)
+            for key, value in stats.items():
+                self.notify_stats[key] += value
+            if stats["sent"]:
+                console.print(f"[dim]{clock()}[/dim] Telegram: надіслано сповіщення про #{n}")
+
+    def analyze(self, n: int, incident: dict) -> dict | None:
+        try:
+            with console.status(f"AI-аналіз інциденту #{n} ({incident['rule']})..."):
+                analysis = agent.analyze_incident(incident, provider=self.provider, dry_run=self.args.dry_run,
+                                                  ip_history=self.db.ip_summary(incident["source_ip"]))
+        except Exception as e:
+            console.print(f"[red]AI-аналіз #{n} не вдався: {type(e).__name__}: {e}[/red]")
+            return None
+        self.ai_done += 1
+        print_analysis(n, incident, analysis)
+        return analysis
+
+    def elapsed(self) -> int:
+        return int(time.monotonic() - self.started)
+
+    def status_text(self) -> str:
+        incidents = self.tracker.all()
+        by_severity = {}
+        for inc in incidents:
+            by_severity[inc["severity"]] = by_severity.get(inc["severity"], 0) + 1
+        breakdown = ", ".join(f"{sev}: {by_severity[sev]}" for sev in SEVERITY_STYLE if sev in by_severity)
+        text = (f"Live {self.elapsed()} с · рядків {sum(s.lines for s in self.sources)}, "
+                f"подій {sum(s.events for s in self.sources)} (у вікні {len(self.window)}) · "
+                f"інцидентів {len(incidents)}" + (f" ({breakdown})" if breakdown else ""))
+        if self.provider is not None:
+            text += f" · AI {self.ai_done}"
+        if self.sent_log is not None:
+            text += (f" · Telegram dry-run {self.notify_stats['dry_run']}" if self.args.dry_run
+                     else f" · Telegram {self.notify_stats['sent']}")
+        return text
+
+    def print_report(self, reason: str) -> None:
+        console.print(f"\n[bold]Live зупинено ({reason})[/bold] через {self.elapsed()} с")
+        print_files([s.stats() for s in self.sources])
+        incidents = self.tracker.all()
+        print_incidents(incidents)
+        if self.provider is not None:
+            console.print(f"AI-агент проаналізував {self.ai_done} раз(и), інцидентів {len(incidents)}"
+                          + (" [dim](dry-run)[/dim]" if self.args.dry_run else ""))
+        if self.sent_log is not None:
+            s = self.notify_stats
+            parts = [f"dry-run, надруковано {s['dry_run']}" if self.args.dry_run else f"надіслано {s['sent']}"]
+            if s["duplicate"]:
+                parts.append(f"вже надсилались раніше {s['duplicate']}")
+            if s["failed"]:
+                parts.append(f"[yellow]не вдалося {s['failed']}[/yellow]")
+            console.print(f"Telegram-сповіщення: {', '.join(parts)}")
+        print_summary(sum(s.events for s in self.sources), incidents)
+
+
+def run_live(args: argparse.Namespace, sleep: Callable[[float], None] = time.sleep) -> int:
+    with history.History(args.history_db) as db:
+        session = LiveSession(args, db)
+        modes = [f"вікно детектора {int(live.WINDOW.total_seconds() // 60)} хв", f"історія {args.history_db}"]
+        if session.provider is not None:
+            modes.append("AI" + (" (dry-run)" if args.dry_run else ""))
+        if args.notify:
+            modes.append("Telegram" + (" (dry-run)" if args.dry_run else ""))
+        console.print(f"[bold]SIEM-lite live[/bold]: {', '.join(modes)}")
+        for source in session.sources:
+            state = (f"формат {source.format or '?'}, з кінця файлу ({source.tail.pos} байт)"
+                     if source.path.is_file() else "файлу ще немає, чекаю на нього")
+            console.print(f"  стежу: {source.path} ({state})")
+        console.print("[dim]Ctrl+C: зупинити з підсумком[/dim]")
+
+        reason = "Ctrl+C"
+        last_status = time.monotonic()
+        try:
+            with console.status(session.status_text()) as status:
+                while args.duration is None or time.monotonic() - session.started < args.duration:
+                    session.poll()
+                    status.update(session.status_text())
+                    # У файл spinner не пишеться, тому статус — окремим рядком час від часу
+                    if not console.is_terminal and time.monotonic() - last_status >= LIVE_STATUS_EVERY:
+                        console.print(f"[dim]{clock()} {escape(session.status_text())}[/dim]")
+                        last_status = time.monotonic()
+                    sleep(args.poll)
+                reason = f"--duration {args.duration:g} с"
+        except KeyboardInterrupt:
+            pass
+        session.print_report(reason)
     return 0
 
 
@@ -329,29 +505,49 @@ def positive_int(value: str) -> int:
     return n
 
 
+def positive_float(value: str) -> float:
+    x = float(value)
+    if x <= 0:
+        raise argparse.ArgumentTypeError("має бути числом > 0")
+    return x
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="SIEM-lite: аналіз логів безпеки")
     modes = parser.add_subparsers(dest="mode", required=True)
 
-    batch = modes.add_parser("batch", help="одноразовий прогін готових лог-файлів")
-    batch.add_argument("logs", nargs="+", type=Path, help="шляхи до лог-файлів (auth.log, access.log, ...)")
-    batch.add_argument("--year", type=int, default=None,
-                       help="рік для syslog-логів без року (за замовчуванням — поточний)")
+    # Спільні прапорці batch і live
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("logs", nargs="+", type=Path, help="шляхи до лог-файлів (auth.log, access.log, ...)")
+    common.add_argument("--year", type=int, default=None,
+                        help="рік для syslog-логів без року (за замовчуванням — поточний)")
+    common.add_argument("--history-db", type=Path, default=history.DEFAULT_DB,
+                        help="SQLite-база історії по IP (за замовчуванням history.db)")
+    common.add_argument("--ai", action="store_true", help="проаналізувати інциденти AI-агентом")
+    common.add_argument("--dry-run", action="store_true",
+                        help="без реальних API-викликів: AI-агент з тестовою відповіддю (вмикає --ai), "
+                             "сповіщення друкуються в консоль замість Telegram")
+    common.add_argument("--notify", action="store_true",
+                        help=f"надіслати в Telegram інциденти з severity {notifier.NOTIFY_MIN_SEVERITY} і вище")
+
+    batch = modes.add_parser("batch", parents=[common], help="одноразовий прогін готових лог-файлів")
     batch.add_argument("--rule", action="append", choices=[r.__name__ for r in detector.RULES],
                        help="показувати лише інциденти цього правила (можна кілька разів)")
     batch.add_argument("--ip", action="append", metavar="IP",
                        help="показувати лише інциденти з цього IP (можна кілька разів)")
-    batch.add_argument("--history-db", type=Path, default=history.DEFAULT_DB,
-                       help="SQLite-база історії по IP (за замовчуванням history.db)")
-    batch.add_argument("--ai", action="store_true", help="проаналізувати інциденти AI-агентом")
-    batch.add_argument("--dry-run", action="store_true",
-                       help="без реальних API-викликів: AI-агент з тестовою відповіддю (вмикає --ai), "
-                            "сповіщення друкуються в консоль замість Telegram")
     batch.add_argument("--max-ai", type=positive_int, default=None, metavar="N",
                        help="AI-агент аналізує лише N найсерйозніших інцидентів (ліміт безкоштовного API)")
-    batch.add_argument("--notify", action="store_true",
-                       help=f"надіслати в Telegram інциденти з severity {notifier.NOTIFY_MIN_SEVERITY} і вище")
     batch.set_defaults(func=run_batch)
+
+    live_mode = modes.add_parser("live", parents=[common],
+                                 help="стежити за лог-файлами в реальному часі (як tail -f)")
+    live_mode.add_argument("--max-ai", type=positive_int, default=None, metavar="N",
+                           help="не більше N AI-аналізів за сесію (ліміт безкоштовного API)")
+    live_mode.add_argument("--poll", type=positive_float, default=LIVE_POLL_SECONDS, metavar="SEC",
+                           help=f"як часто перевіряти файли, секунд (за замовчуванням {LIVE_POLL_SECONDS})")
+    live_mode.add_argument("--duration", type=positive_float, default=None, metavar="SEC",
+                           help="зупинитися через SEC секунд (для тестів; інакше — до Ctrl+C)")
+    live_mode.set_defaults(func=run_live)
     return parser
 
 

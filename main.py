@@ -10,17 +10,22 @@
   py -3 main.py batch sample_logs/*.log --ai --dry-run    # без реальних API-викликів
   py -3 main.py batch sample_logs/*.log --ai --rule brute_force
   py -3 main.py batch real_logs/OpenSSH_2k.log --ai --max-ai 3   # лише 3 найсерйозніші
+  py -3 main.py batch sample_logs/*.log --notify --dry-run        # сповіщення в консоль, не в Telegram
+  py -3 main.py batch sample_logs/*.log --ai --notify --ip 203.0.113.77
 
 Усі події пишуться в history.db (історія по IP); агент отримує зведення по IP
-разом з інцидентом.
+разом з інцидентом. З --notify інциденти High/Critical надсилаються в Telegram
+(без дублікатів між запусками); --dry-run друкує сповіщення замість відправки.
 
 Формат кожного файлу (ssh / web) визначається автоматично за першими
 рядками, тому порядок аргументів не важливий.
 """
 
 import argparse
+import html
 import json
 import logging
+import re
 import sys
 from functools import partial
 from itertools import islice
@@ -36,6 +41,7 @@ from rich.table import Table
 import agent
 import detector
 import history
+import notifier
 from parsers import ssh_parser, web_parser
 
 # Скільки перших непорожніх рядків дивитися, щоб визначити формат файлу
@@ -229,15 +235,18 @@ def most_serious(incidents: list[dict], limit: int | None) -> list[tuple[int, di
     return sorted(by_seriousness[:limit], key=lambda ni: ni[0])
 
 
-def run_ai(incidents: list[tuple[int, dict]], dry_run: bool, db: history.History) -> list[dict]:
-    """Проганяє інциденти (номер, інцидент) через агента (+ історія IP); помилка на одному не зупиняє решту."""
+def run_ai(incidents: list[tuple[int, dict]], dry_run: bool, db: history.History) -> dict[int, dict]:
+    """Проганяє інциденти (номер, інцидент) через агента (+ історія IP); помилка на одному не зупиняє решту.
+
+    Повертає {номер інциденту: AI-аналіз}.
+    """
     try:
         provider = agent.get_provider(dry_run)
     except Exception as e:
         console.print(f"[red]AI-агент недоступний: {e}[/red]")
-        return []
+        return {}
 
-    analyses = []
+    analyses = {}
     for n, incident in incidents:
         with console.status(f"AI-аналіз інциденту #{n} ({incident['rule']})..."):
             try:
@@ -247,8 +256,28 @@ def run_ai(incidents: list[tuple[int, dict]], dry_run: bool, db: history.History
                 console.print(f"[red]AI-аналіз #{n} не вдався: {type(e).__name__}: {e}[/red]")
                 continue
         print_analysis(n, incident, analysis)
-        analyses.append(analysis)
+        analyses[n] = analysis
     return analyses
+
+
+def print_telegram_message(text: str) -> None:
+    """Dry-run: повідомлення як його побачить людина в Telegram (без HTML-тегів)."""
+    plain = html.unescape(re.sub(r"<[^>]+>", "", text))
+    console.print(Panel(escape(plain), title="Telegram (dry-run)", title_align="left", expand=False))
+
+
+def run_notify(incidents: list[dict], analyses: dict[int, dict], dry_run: bool, db: history.History) -> None:
+    stats = notifier.notify(
+        [(inc, analyses.get(n)) for n, inc in enumerate(incidents, 1)],
+        sent_log=notifier.SentLog(db.conn), dry_run=dry_run, print_message=print_telegram_message,
+    )
+    parts = [f"надіслано {stats['sent']}"] if not dry_run else [f"dry-run, надруковано {stats['dry_run']}"]
+    if stats["duplicate"]:
+        parts.append(f"вже надсилались раніше {stats['duplicate']}")
+    if stats["failed"]:
+        parts.append(f"[yellow]не вдалося {stats['failed']}[/yellow]")
+    parts.append(f"нижче порогу {notifier.NOTIFY_MIN_SEVERITY} {stats['below_threshold']}")
+    console.print(f"Telegram-сповіщення: {', '.join(parts)}")
 
 
 def run_batch(args: argparse.Namespace) -> int:
@@ -262,6 +291,8 @@ def run_batch(args: argparse.Namespace) -> int:
     incidents = detector.detect(events)
     if args.rule:
         incidents = [i for i in incidents if i["rule"] in args.rule]
+    if args.ip:
+        incidents = [i for i in incidents if i["source_ip"] in args.ip]
 
     print_files(stats)
     with history.History(args.history_db) as db:
@@ -271,6 +302,7 @@ def run_batch(args: argparse.Namespace) -> int:
         console.print()
         print_incidents(incidents)
 
+        analyses = {}
         if args.ai or args.dry_run:
             console.print()
             selected = most_serious(incidents, args.max_ai)
@@ -281,6 +313,10 @@ def run_batch(args: argparse.Namespace) -> int:
             analyses = run_ai(selected, dry_run=args.dry_run, db=db)
             console.print(f"\nAI-агент проаналізував {len(analyses)} з {len(incidents)} інцидентів"
                           + (" [dim](dry-run)[/dim]" if args.dry_run else ""))
+
+        if args.notify:
+            console.print()
+            run_notify(incidents, analyses, dry_run=args.dry_run, db=db)
 
     print_summary(events, incidents)
     return 0
@@ -303,13 +339,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="рік для syslog-логів без року (за замовчуванням — поточний)")
     batch.add_argument("--rule", action="append", choices=[r.__name__ for r in detector.RULES],
                        help="показувати лише інциденти цього правила (можна кілька разів)")
+    batch.add_argument("--ip", action="append", metavar="IP",
+                       help="показувати лише інциденти з цього IP (можна кілька разів)")
     batch.add_argument("--history-db", type=Path, default=history.DEFAULT_DB,
                        help="SQLite-база історії по IP (за замовчуванням history.db)")
     batch.add_argument("--ai", action="store_true", help="проаналізувати інциденти AI-агентом")
     batch.add_argument("--dry-run", action="store_true",
-                       help="AI-агент без реальних API-викликів, з тестовою відповіддю (вмикає --ai)")
+                       help="без реальних API-викликів: AI-агент з тестовою відповіддю (вмикає --ai), "
+                            "сповіщення друкуються в консоль замість Telegram")
     batch.add_argument("--max-ai", type=positive_int, default=None, metavar="N",
                        help="AI-агент аналізує лише N найсерйозніших інцидентів (ліміт безкоштовного API)")
+    batch.add_argument("--notify", action="store_true",
+                       help=f"надіслати в Telegram інциденти з severity {notifier.NOTIFY_MIN_SEVERITY} і вище")
     batch.set_defaults(func=run_batch)
     return parser
 

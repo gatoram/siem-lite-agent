@@ -92,9 +92,20 @@
    (`success_after_failures`), перша й остання поява. `main.py batch` пише
    всі події в базу і передає зведення агенту разом з інцидентом.
 
-6. **Сповіщення** (`notifier.py`) — при severity High/Critical: повідомлення
-   в Telegram через Bot API (`requests.post` на `sendMessage`). Всі
-   інциденти (не лише критичні) пишуться у звіт/лог-файл.
+6. **Сповіщення** (`notifier.py`) — при severity High/Critical (поріг —
+   константа `NOTIFY_MIN_SEVERITY`): повідомлення в Telegram через Bot API
+   (`requests.post` на `sendMessage`). Коротке, для телефона: severity з
+   емодзі, правило, IP, кількість подій, час, а далі висновок AI-агента
+   (тип загрози, пояснення, рекомендація) або, якщо AI-аналізу не було, дані
+   детектора. Дублікати не надсилаються: інцидент = (IP, правило, час першої
+   події), надіслані записуються в таблицю `notifications` у `history.db`.
+   Недоступний Telegram — попередження, програма працює далі (інцидент
+   спробує надіслатись наступного запуску).
+
+   Запуск: `py -3 main.py batch sample_logs/*.log --ai --notify`
+   (`--dry-run` — повідомлення друкуються в консоль; `--ip` — лише інциденти
+   з цього IP). Всі інциденти (не лише критичні) пишуться у звіт/лог-файл —
+   ще не реалізовано.
 
 7. **Точка входу** (`main.py`) — режим "live" (файловий watcher/tail -f по
    логах, працює у фоні постійно) і режим "batch" (одноразовий прогін
@@ -119,7 +130,7 @@
 використовуватись у коді: `py -3 -m pip install -r requirements.txt`.
 
 Ключі — у `.env` (шаблон: `.env.example`): `LLM_PROVIDER`, `GEMINI_API_KEY`,
-`ABUSEIPDB_API_KEY`.
+`ABUSEIPDB_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
 
 ## Milestone-план
 

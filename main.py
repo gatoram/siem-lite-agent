@@ -9,6 +9,7 @@
   py -3 main.py batch sample_logs/*.log --ai              # + аналіз AI-агентом
   py -3 main.py batch sample_logs/*.log --ai --dry-run    # без реальних API-викликів
   py -3 main.py batch sample_logs/*.log --ai --rule brute_force
+  py -3 main.py batch real_logs/OpenSSH_2k.log --ai --max-ai 3   # лише 3 найсерйозніші
 
 Усі події пишуться в history.db (історія по IP); агент отримує зведення по IP
 разом з інцидентом.
@@ -213,8 +214,23 @@ def print_analysis(n: int, incident: dict, analysis: dict) -> None:
     console.print(Panel("\n".join(lines), title=f"AI-аналіз #{n}", subtitle=model, title_align="left"))
 
 
-def run_ai(incidents: list[dict], dry_run: bool, db: history.History) -> list[dict]:
-    """Проганяє інциденти через агента (+ історія IP); помилка на одному інциденті не зупиняє решту."""
+def most_serious(incidents: list[dict], limit: int | None) -> list[tuple[int, dict]]:
+    """Найсерйозніші інциденти для AI-агента: за severity детектора, потім за кількістю подій.
+
+    Повертає пари (номер у таблиці інцидентів, інцидент) у порядку таблиці,
+    щоб номери в AI-аналізі збігалися з таблицею.
+    """
+    numbered = list(enumerate(incidents, 1))
+    if limit is None or limit >= len(numbered):
+        return numbered
+    rank = list(SEVERITY_STYLE)  # Critical, High, Medium, Low
+    by_seriousness = sorted(numbered, key=lambda ni: (rank.index(ni[1]["severity"]) if ni[1]["severity"] in rank
+                                                      else len(rank), -ni[1]["event_count"]))
+    return sorted(by_seriousness[:limit], key=lambda ni: ni[0])
+
+
+def run_ai(incidents: list[tuple[int, dict]], dry_run: bool, db: history.History) -> list[dict]:
+    """Проганяє інциденти (номер, інцидент) через агента (+ історія IP); помилка на одному не зупиняє решту."""
     try:
         provider = agent.get_provider(dry_run)
     except Exception as e:
@@ -222,7 +238,7 @@ def run_ai(incidents: list[dict], dry_run: bool, db: history.History) -> list[di
         return []
 
     analyses = []
-    for n, incident in enumerate(incidents, 1):
+    for n, incident in incidents:
         with console.status(f"AI-аналіз інциденту #{n} ({incident['rule']})..."):
             try:
                 analysis = agent.analyze_incident(incident, provider=provider, dry_run=dry_run,
@@ -257,12 +273,24 @@ def run_batch(args: argparse.Namespace) -> int:
 
         if args.ai or args.dry_run:
             console.print()
-            analyses = run_ai(incidents, dry_run=args.dry_run, db=db)
+            selected = most_serious(incidents, args.max_ai)
+            if len(selected) < len(incidents):
+                console.print(f"[dim]--max-ai {args.max_ai}: AI-агент аналізує {len(selected)} найсерйозніших "
+                              f"(severity, потім кількість подій): "
+                              f"#{', #'.join(str(n) for n, _ in selected)}[/dim]")
+            analyses = run_ai(selected, dry_run=args.dry_run, db=db)
             console.print(f"\nAI-агент проаналізував {len(analyses)} з {len(incidents)} інцидентів"
                           + (" [dim](dry-run)[/dim]" if args.dry_run else ""))
 
     print_summary(events, incidents)
     return 0
+
+
+def positive_int(value: str) -> int:
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError("має бути цілим числом >= 1")
+    return n
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -280,6 +308,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     batch.add_argument("--ai", action="store_true", help="проаналізувати інциденти AI-агентом")
     batch.add_argument("--dry-run", action="store_true",
                        help="AI-агент без реальних API-викликів, з тестовою відповіддю (вмикає --ai)")
+    batch.add_argument("--max-ai", type=positive_int, default=None, metavar="N",
+                       help="AI-агент аналізує лише N найсерйозніших інцидентів (ліміт безкоштовного API)")
     batch.set_defaults(func=run_batch)
     return parser
 
@@ -287,6 +317,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
     # Попередження агента (повтори після 429 тощо) — у ту саму консоль
     logging.basicConfig(level=logging.WARNING, format="%(message)s",
                         handlers=[RichHandler(console=console, show_path=False)])

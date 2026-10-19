@@ -63,8 +63,10 @@ class History:
         total, first_seen, last_seen = self.conn.execute(
             "SELECT COUNT(*), MIN(timestamp), MAX(timestamp) FROM events WHERE source_ip = ?", (ip,)
         ).fetchone()
+        # Подія "message repeated N times" рахується як N спроб
         by_type = dict(self.conn.execute(
-            "SELECT event_type, COUNT(*) FROM events WHERE source_ip = ? GROUP BY event_type", (ip,)))
+            "SELECT event_type, SUM(COALESCE(json_extract(meta, '$.repeated'), 1)) "
+            "FROM events WHERE source_ip = ? GROUP BY event_type", (ip,)))
         by_source = dict(self.conn.execute(
             "SELECT log_source, COUNT(*) FROM events WHERE source_ip = ? GROUP BY log_source", (ip,)))
         compromise = self._success_after_failures(ip)
@@ -93,7 +95,7 @@ class History:
             if event_type == "login_fail":
                 if fails_in_row == 0:
                     series_start = timestamp
-                fails_in_row += 1
+                fails_in_row += json.loads(meta).get("repeated", 1)
                 continue
             if fails_in_row >= FAILS_BEFORE_SUCCESS_MIN:
                 return {

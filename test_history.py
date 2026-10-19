@@ -62,6 +62,16 @@ def main() -> None:
     db.store_events(typo)
     assert db.ip_summary("10.9.9.9")["success_after_failures"] is False
 
+    # "message repeated 5 times" рахується як 5 невдалих: 1 + 5 невдалих поспіль і успішний вхід = злам
+    repeated = [ssh_event("2026-10-01T10:00:00", "10.8.8.8", "login_fail"),
+                ssh_event("2026-10-01T10:00:05", "10.8.8.8", "login_fail"),
+                ssh_event("2026-10-01T10:00:30", "10.8.8.8", "login_success")]
+    repeated[1]["meta"]["repeated"] = 5
+    db.store_events(repeated)
+    weighted = db.ip_summary("10.8.8.8")
+    assert weighted["total_events"] == 3 and weighted["login_fail"] == 6
+    assert weighted["success_after_failures_detail"]["failures_before"] == 6
+
     db.close()
     print("Усі перевірки пройдено.")
 

@@ -45,6 +45,10 @@
 
 2. **Парсери** (`parsers/ssh_parser.py`, `parsers/web_parser.py`) —
    перетворюють сирі рядки в уніфікований формат події (вище).
+   SSH-парсер перевірено на реальному лозі (`real_logs/OpenSSH_2k.log`,
+   вибірка OpenSSH з Loghub, logpai/loghub): розпізнаються всі рядки
+   Failed/Accepted, включно з `message repeated N times: [...]` (одна подія з
+   `meta.repeated = N`; детектор і історія рахують її як N спроб).
 
 3. **Rule-based детектор** (`detector.py`) — правила на першому етапі:
    - brute-force: N невдалих логінів за M хвилин з одного IP (SSH); якщо
@@ -76,7 +80,10 @@
    повторюється з паузою.
 
    Запуск: `py -3 main.py batch sample_logs/auth.log sample_logs/access.log --ai`
-   (`--dry-run` — без API, `--rule brute_force` — лише одне правило).
+   (`--dry-run` — без API, `--rule brute_force` — лише одне правило,
+   `--max-ai N` — агент аналізує лише N найсерйозніших інцидентів: за
+   severity детектора, потім за кількістю подій; через ліміт безкоштовного
+   тарифу Gemini).
 
 5. **Історія по IP** (`history.py`, SQLite `history.db`) — кожна подія по IP
    зберігається (без дублікатів при повторному прогоні), щоб агент бачив

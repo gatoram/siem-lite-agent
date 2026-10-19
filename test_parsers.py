@@ -15,6 +15,8 @@ from pathlib import Path
 from parsers import ssh_parser, web_parser
 
 LOGS_DIR = Path(__file__).parent / "sample_logs"
+# Реальний лог: вибірка OpenSSH_2k з Loghub (github.com/logpai/loghub)
+REAL_SSH_LOG = Path(__file__).parent / "real_logs" / "OpenSSH_2k.log"
 # sample_logs згенеровані за 30.09.2026 — рік задаємо явно, щоб тест не
 # залежав від поточної дати
 LOG_YEAR = 2026
@@ -72,7 +74,47 @@ def main() -> None:
     assert ssh_parser.parse_line("garbage") is None
     assert web_parser.parse_line("garbage") is None
 
+    check_real_ssh_log()
+
     print("\nУсі перевірки пройдено.")
+
+
+def check_real_ssh_log() -> None:
+    """Формати з реального sshd, яких немає в синтетичному auth.log."""
+    # "message repeated N times" — одна подія з вагою N
+    repeated = ssh_parser.parse_line(
+        "Dec 10 07:13:56 LabSZ sshd[24227]: message repeated 5 times: "
+        "[ Failed password for root from 5.36.59.76 port 42393 ssh2]", year=2026)
+    assert repeated["event_type"] == "login_fail"
+    assert repeated["source_ip"] == "5.36.59.76"
+    assert repeated["meta"]["user"] == "root"
+    assert repeated["meta"]["repeated"] == 5
+    # Ім'я з пробілом на початку
+    spaced = ssh_parser.parse_line(
+        "Dec 10 08:30:12 LabSZ sshd[24361]: Failed password for invalid user  0101 "
+        "from 5.188.10.180 port 36279 ssh2", year=2026)
+    assert spaced["meta"]["invalid_user"] and spaced["meta"]["user"] == "0101"
+    # Метод "none"
+    none = ssh_parser.parse_line(
+        "Dec 10 09:00:00 LabSZ sshd[1]: Failed none for invalid user admin "
+        "from 192.0.2.1 port 1 ssh2", year=2026)
+    assert none["meta"]["auth_method"] == "none"
+    # Звичайні рядки не отримують meta["repeated"]
+    assert "repeated" not in none["meta"]
+
+    if not REAL_SSH_LOG.is_file():
+        print(f"\n{REAL_SSH_LOG} немає, перевірку на реальному лозі пропущено")
+        return
+    events = ssh_parser.parse_file(REAL_SSH_LOG, year=2026)
+    counts = Counter(e["event_type"] for e in events)
+    print(f"\nРеальний лог {REAL_SSH_LOG.name}: {count_lines(REAL_SSH_LOG)} рядків, "
+          f"подій {len(events)} {dict(counts)}")
+    # Усі рядки Failed/Accepted (включно з "message repeated") розпізнані
+    with open(REAL_SSH_LOG, encoding="utf-8") as f:
+        auth_lines = sum(("Failed " in line or "Accepted " in line) for line in f)
+    assert len(events) == auth_lines == 525
+    assert counts == {"login_fail": 524, "login_success": 1}
+    assert sum(e["meta"].get("repeated", 1) for e in events) == 533
 
 
 if __name__ == "__main__":

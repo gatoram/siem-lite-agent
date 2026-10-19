@@ -106,6 +106,13 @@ def main() -> None:
     ]
     assert detector.sqli(benign) == [] and detector.xss(benign) == []
 
+    # "message repeated N times" (реальний sshd): 2 рядки по 5 спроб = 10 спроб = brute-force
+    repeated = [dict(e, meta=dict(e["meta"], repeated=5))
+                for e in events if e["source_ip"] == BRUTE_FORCE_IP][:2]
+    weighted = detector.brute_force(repeated)
+    assert len(weighted) == 1 and weighted[0]["details"]["failed_attempts"] == 10
+    assert weighted[0]["event_count"] == 2
+
     print("Усі перевірки пройдено.")
 
 

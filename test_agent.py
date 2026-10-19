@@ -16,6 +16,7 @@ import requests
 import agent
 import detector
 import history
+import main as siem_main
 from parsers import ssh_parser, web_parser
 
 LOGS_DIR = Path(__file__).parent / "sample_logs"
@@ -129,6 +130,13 @@ def main() -> None:
     # Некоректна severity → беремо від детектора
     verdict = agent.parse_verdict('{"severity": "Катастрофа"}', fallback_severity="High")
     assert verdict["severity"] == "High"
+
+    # --- --max-ai: N найсерйозніших за severity, потім за кількістю подій; номери з таблиці ---
+    ranked = [{"severity": "High", "event_count": 30}, {"severity": "Critical", "event_count": 5},
+              {"severity": "High", "event_count": 80}, {"severity": "Medium", "event_count": 500}]
+    assert [n for n, _ in siem_main.most_serious(ranked, 2)] == [2, 3]
+    assert [n for n, _ in siem_main.most_serious(ranked, None)] == [1, 2, 3, 4]
+    assert [n for n, _ in siem_main.most_serious(ranked, 10)] == [1, 2, 3, 4]
 
     print("\nУсі перевірки пройдено.")
 

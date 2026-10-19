@@ -68,6 +68,11 @@ _XSS_RE = {name: re.compile(p, re.IGNORECASE) for name, p in XSS_PATTERNS.items(
 
 # ---------------------------------------------------------- допоміжні функції
 
+def _attempts(events: list[dict]) -> int:
+    """Кількість спроб: подія "message repeated N times" важить N (meta["repeated"])."""
+    return sum(e["meta"].get("repeated", 1) for e in events)
+
+
 def _ts(event: dict) -> datetime:
     return datetime.fromisoformat(event["timestamp"])
 
@@ -146,9 +151,9 @@ def brute_force(events: list[dict]) -> list[dict]:
         fails = [e for e in ip_events if e["event_type"] == "login_fail"]
         successes = [e for e in ip_events if e["event_type"] == "login_success"]
         for burst in _find_bursts(fails, BRUTE_FORCE_WINDOW,
-                                  lambda w: len(w) >= BRUTE_FORCE_MIN_FAILS):
+                                  lambda w: _attempts(w) >= BRUTE_FORCE_MIN_FAILS):
             details = {
-                "failed_attempts": len(burst),
+                "failed_attempts": _attempts(burst),
                 "targeted_users": sorted({e["meta"].get("user") for e in burst} - {None}),
                 "login_success_after": False,
             }

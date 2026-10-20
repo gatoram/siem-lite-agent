@@ -253,3 +253,34 @@ parsers/web_parser.py, що перетворюють рядки з sample_logs �
   - Web-час у логах і таблиці в UTC (як у batch), SSH-час місцевий, тому SQLi показано як 12:06, а не 15:06.
   - Heredoc з великим Python-скриптом у bash не розібрався, тому правку main.py зроблено скриптом з файлу.
 - Файли: `live.py`, `simulate_attack.py`, `test_live.py` (створено), `main.py`, `notifier.py`, `test_notifier.py`, `.gitignore`, `PROJECT_BRIEF.md`, `NOTES.md` (змінено)
+
+## [2026-10-20] Третє джерело логів: firewall (ufw/iptables) і правило port_scanning
+- Промпт: Додай третє джерело логів: firewall (iptables/ufw).
+
+  - parsers/firewall_parser.py: розбирає рядки ufw/iptables з syslog
+    (наприклад "[UFW BLOCK] ... SRC=1.2.3.4 DST=... PROTO=TCP DPT=22")
+    в той самий уніфікований формат події. event_type: firewall_block,
+    у meta: протокол, порт призначення (dpt), інтерфейс
+  - Детектор: нове правило port_scanning — один IP стукає в N+ різних
+    портів за M хвилин (поріг у константу). severity Medium. Це розвідка
+    перед атакою
+  - main.py (batch і live) має автоматично розпізнавати firewall-логи,
+    як уже розпізнає ssh і web
+  - Згенеруй приклад firewall-логу в generate_logs.py: звичайні блокування
+    + сканування портів з одного IP. Додай у тести
+  - Онови PROJECT_BRIEF.md
+
+  Протестуй: прожени через batch, покажи, що port_scanning знайдено,
+  і що хибних спрацювань немає.
+- Що зроблено:
+  - `parsers/firewall_parser.py`: рядки ядра (`kernel: [uptime] <префікс> IN=... SRC=... DPT=...`) з ufw та iptables. Дію визначає префікс: ALLOW/ACCEPT дає `firewall_allow`, AUDIT пропускається як дубль, решта (`UFW BLOCK`, `IPTABLES-DROP`, рядок без префікса) дає `firewall_block`. meta: proto, dpt, spt, interface, dst, action, host. Для ICMP dpt = None. Час і рік розбирає та сама функція, що в ssh_parser.
+  - `detector.port_scanning`: `PORT_SCAN_MIN_PORTS` = 10 різних dpt заблокованих пакетів з одного IP за `PORT_SCAN_WINDOW` = 5 хв, severity Medium. details: unique_ports, ports (до 20), protocols.
+  - `main.py`: `"firewall"` у реєстрі `get_parsers`, тому автовизначення формату працює і в batch, і в live. В історії IP додано `firewall_blocks` (видно в панелі й у промпті агента), у dry-run агента є відповідь для port_scanning.
+  - `generate_logs.py` пише `sample_logs/firewall.log` з окремим rng, тож auth.log і access.log не змінились. Там ~200 блокувань шуму (1-3 порти з IP) і скан 25 портів з 198.51.100.200 о 14:02, за 3 хв до сканування шляхів з того ж IP. Також два "майже скани": 12 портів по одному на годину (203.0.113.180) і 40 спроб в RDP за 3 хв (192.0.2.201). Тести: `test_parsers.py` (файл, формати ufw/iptables/ICMP/ALLOW/AUDIT, перехресна перевірка ssh↔firewall), `test_detector.py` (5 інцидентів, межі правила, без хибних спрацювань).
+- Результат batch (`auth.log access.log firewall.log`): формат `firewall` визначено автоматично, 277/277 рядків розпізнано. 5 інцидентів, і це рівно очікувані: brute_force ×2 (High, Critical), port_scanning 198.51.100.200 (Medium, 25 портів, 14:02:00 → 14:02:23), path_scanning з того ж IP, sqli. Повільний перебір, удари в один порт і шум інцидентів не дали. AI dry-run для 198.51.100.200: в історії видно і firewall, і web (50 подій), тобто розвідку й подальший скан шляхів.
+- Результат live (dry-run, порожній файл, дописування з поточним часом): формат визначено за першим рядком. Скан 15 портів почався о 16:15:00, інцидент виявлено о 16:15:04 на 10-му порту, ще до кінця скану. 2 рядки шуму інцидентів не дали. Telegram нічого не отримав, бо Medium нижче порогу High, як і задумано.
+- Проблеми і як вирішено:
+  - Heredoc з Python-скриптом знову не розібрався в bash, тому правки тестів і документації зроблено скриптами з файлу.
+  - port_scanning рахує лише `firewall_block`: дозволені з'єднання (80/443) ufw за замовчуванням не логує, а легітимні клієнти ходять саме туди.
+  - Не підтримано: формат RFC 3339 (`2026-09-30T14:02:11.123+00:00 host kernel: ...`), який новий rsyslog у Ubuntu пише за замовчуванням (ssh_parser його теж не підтримує). Також змішаний `/var/log/syslog`, де в одному файлі і sshd, і kernel: формат визначається один на файл.
+- Файли: `parsers/firewall_parser.py`, `sample_logs/firewall.log` (створено); `parsers/__init__.py`, `detector.py`, `main.py`, `live.py`, `history.py`, `agent.py`, `generate_logs.py`, `test_parsers.py`, `test_detector.py`, `PROJECT_BRIEF.md`, `NOTES.md` (змінено)

@@ -78,6 +78,7 @@ class History:
             "login_fail": by_type.get("login_fail", 0),
             "login_success": by_type.get("login_success", 0),
             "http_requests": by_type.get("http_request", 0),
+            "firewall_blocks": by_type.get("firewall_block", 0),
             "success_after_failures": compromise is not None,
             "success_after_failures_detail": compromise,
             "first_seen": first_seen,

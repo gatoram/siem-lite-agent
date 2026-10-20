@@ -5,6 +5,6 @@
   parse_file(path) -> list[dict]    — усі розпізнані події з файлу
 """
 
-from parsers import ssh_parser, web_parser
+from parsers import firewall_parser, ssh_parser, web_parser
 
-__all__ = ["ssh_parser", "web_parser"]
+__all__ = ["firewall_parser", "ssh_parser", "web_parser"]

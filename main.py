@@ -5,7 +5,7 @@
   live  — стеження за логами в реальному часі (як tail -f, з кінця файлів)
 
 Приклад:
-  py -3 main.py batch sample_logs/auth.log sample_logs/access.log
+  py -3 main.py batch sample_logs/auth.log sample_logs/access.log sample_logs/firewall.log
   py -3 main.py batch sample_logs/*.log --ai              # + аналіз AI-агентом
   py -3 main.py batch sample_logs/*.log --ai --dry-run    # без реальних API-викликів
   py -3 main.py batch sample_logs/*.log --ai --rule brute_force
@@ -19,7 +19,7 @@
 разом з інцидентом. З --notify інциденти High/Critical надсилаються в Telegram
 (без дублікатів між запусками); --dry-run друкує сповіщення замість відправки.
 
-Формат кожного файлу (ssh / web) визначається автоматично за першими
+Формат кожного файлу (ssh / web / firewall) визначається автоматично за першими
 рядками, тому порядок аргументів не важливий.
 
 У live нові рядки парсяться, пишуться в history.db, а детектор щоразу
@@ -53,7 +53,7 @@ import detector
 import history
 import live
 import notifier
-from parsers import ssh_parser, web_parser
+from parsers import firewall_parser, ssh_parser, web_parser
 
 # Скільки перших непорожніх рядків дивитися, щоб визначити формат файлу
 DETECT_SAMPLE_LINES = 20
@@ -73,6 +73,7 @@ def get_parsers(year: int | None) -> dict[str, Callable[[str], dict | None]]:
     return {
         "ssh": partial(ssh_parser.parse_line, year=year),
         "web": web_parser.parse_line,
+        "firewall": partial(firewall_parser.parse_line, year=year),
     }
 
 
@@ -194,6 +195,8 @@ def format_history(summary: dict | None) -> str:
     text = (f"подій {summary['total_events']}, невдалих входів {summary['login_fail']}, "
             f"успішних {summary['login_success']}, {short_time(summary['first_seen'])} → "
             f"{short_time(summary['last_seen'])}")
+    if summary.get("firewall_blocks"):
+        text += f", заблоковано firewall-ом {summary['firewall_blocks']}"
     if detail := summary["success_after_failures_detail"]:
         text += (f"\n  [bold red]успішний вхід {escape(str(detail['user']))} о {short_time(detail['success_time'])} "
                  f"після {detail['failures_before']} невдалих поспіль[/bold red]")

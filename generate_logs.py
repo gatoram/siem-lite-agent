@@ -7,6 +7,12 @@
                               вхід успішний (зламаний пароль admin)
   sample_logs/access.log — ~200 нормальних web-запитів (nginx combined)
                            + сканування шляхів + SQLi-спроба в параметрі
+  sample_logs/firewall.log — ~200 звичайних блокувань ufw (інтернет-шум:
+                           1-3 порти з IP) + сканування портів з IP веб-сканера
+                           (розвідка перед сканом шляхів) + два "майже
+                           сканування", що НЕ мають спрацьовувати: повільний
+                           перебір портів (раз на годину) і багато спроб в
+                           один порт
 
 Атакуючі IP взяті з документаційних діапазонів (RFC 5737), щоб не зачіпати
 реальні адреси. Генерація детермінована (фіксований seed) — однаковий
@@ -76,6 +82,26 @@ SCAN_PATHS = [
 SQLI_IP = "192.0.2.66"
 SQLI_UA = "sqlmap/1.8.4#stable (https://sqlmap.org)"
 SQLI_PAYLOAD = "1' OR '1'='1' -- "
+
+
+# Firewall: зовнішня адреса сервера, на яку йде трафік з інтернету
+FIREWALL_IFACE = "eth0"
+SERVER_EXT_IP = "203.0.113.10"
+FIREWALL_START_UPTIME = 1_234_567.0  # [секунди від завантаження ядра] у рядку kernel
+# Порти, які типово "мацають" боти (усі закриті, тож ufw їх блокує й логує)
+NOISE_PORTS = [(23, "TCP"), (445, "TCP"), (3389, "TCP"), (1433, "TCP"), (5900, "TCP"),
+               (8080, "TCP"), (2323, "TCP"), (6379, "TCP"), (123, "UDP"), (161, "UDP"),
+               (53, "UDP"), (None, "ICMP")]
+# Порт-скан з того ж IP, що й сканування шляхів (за 3 хвилини до нього)
+PORT_SCAN_START = datetime(2026, 9, 30, 14, 2, 0)
+PORT_SCAN_PORTS = [21, 22, 23, 25, 53, 110, 111, 135, 139, 143, 445, 993, 995, 1433, 1521,
+                   1723, 3306, 3389, 5432, 5900, 6379, 8080, 8443, 9200, 27017]
+# Не мають спрацьовувати: 12 різних портів, але по одному на годину
+SLOW_SCAN_IP = "203.0.113.180"
+SLOW_SCAN_START = datetime(2026, 9, 30, 6, 30, 0)
+# Не мають спрацьовувати: 40 спроб в один порт (RDP) за ~3 хвилини
+SINGLE_PORT_IP = "192.0.2.201"
+SINGLE_PORT_START = datetime(2026, 9, 30, 10, 15, 0)
 
 
 def random_time(rng: random.Random) -> datetime:
@@ -182,6 +208,59 @@ def generate_access_log(rng: random.Random) -> list[tuple[datetime, str]]:
     return entries
 
 
+# ------------------------------------------------------------- ufw firewall.log
+
+def firewall_line(ts: datetime, rng: random.Random, src: str, dpt: int | None, proto: str) -> str:
+    # ufw: "Sep 30 14:02:11 host kernel: [86531.204117] [UFW BLOCK] IN=eth0 OUT= ... SRC=... DPT=22 ..."
+    uptime = FIREWALL_START_UPTIME + (ts - START_TIME).total_seconds() + rng.random()
+    head = (f"{ts.strftime('%b')} {ts.day:>2} {ts.strftime('%H:%M:%S')} {HOSTNAME} kernel: "
+            f"[{uptime:.6f}] [UFW BLOCK] IN={FIREWALL_IFACE} OUT= "
+            f"MAC=52:54:00:12:34:56:52:54:00:65:43:21:08:00 SRC={src} DST={SERVER_EXT_IP} ")
+    ttl, packet_id = rng.randint(40, 250), rng.randint(1, 65535)
+    if proto == "ICMP":
+        return head + f"LEN=84 TOS=0x00 PREC=0x00 TTL={ttl} ID={packet_id} PROTO=ICMP TYPE=8 CODE=0 ID={rng.randint(1, 65535)} SEQ=1"
+    spt = rng.randint(1024, 65535)
+    if proto == "UDP":
+        return head + f"LEN=40 TOS=0x00 PREC=0x00 TTL={ttl} ID={packet_id} PROTO=UDP SPT={spt} DPT={dpt} LEN=20"
+    return head + (f"LEN=44 TOS=0x00 PREC=0x00 TTL={ttl} ID={packet_id} PROTO=TCP SPT={spt} DPT={dpt} "
+                   f"WINDOW=1024 RES=0x00 SYN URGP=0")
+
+
+def generate_firewall_log(rng: random.Random) -> list[tuple[datetime, str]]:
+    """Окремий rng (як у generate_compromise), щоб auth.log і access.log не змінились."""
+    entries = []
+
+    # ~200 блокувань інтернет-шуму: кілька десятків випадкових IP, кожен — 1-3 порти протягом доби
+    noise_ips = [f"{net}.{rng.randint(2, 250)}" for net in ("192.0.2", "198.51.100", "203.0.113")
+                 for _ in range(25)]
+    noise_ips = [ip for ip in dict.fromkeys(noise_ips)
+                 if ip not in (SERVER_EXT_IP, SCANNER_IP, SLOW_SCAN_IP, SINGLE_PORT_IP,
+                               BRUTE_FORCE_IP, COMPROMISE_IP, SQLI_IP)]
+    while len(entries) < 200:
+        ip = rng.choice(noise_ips)
+        for dpt, proto in rng.sample(NOISE_PORTS, rng.randint(1, 3)):
+            ts = random_time(rng)
+            entries.append((ts, firewall_line(ts, rng, ip, dpt, proto)))
+
+    # Сканування портів: 25 портів приблизно за 25 секунд (SYN-скан, як nmap)
+    t = PORT_SCAN_START
+    for dpt in rng.sample(PORT_SCAN_PORTS, len(PORT_SCAN_PORTS)):
+        t += timedelta(milliseconds=rng.randint(300, 1500))
+        entries.append((t, firewall_line(t, rng, SCANNER_IP, dpt, "TCP")))
+
+    # Повільний перебір: 12 різних портів, по одному на годину — не сканування за PORT_SCAN_WINDOW
+    for hour, dpt in enumerate(PORT_SCAN_PORTS[:12]):
+        ts = SLOW_SCAN_START + timedelta(hours=hour, seconds=rng.randint(0, 600))
+        entries.append((ts, firewall_line(ts, rng, SLOW_SCAN_IP, dpt, "TCP")))
+
+    # Один порт багато разів — це не сканування портів
+    for offset in sorted(rng.sample(range(0, 180), 40)):
+        ts = SINGLE_PORT_START + timedelta(seconds=offset)
+        entries.append((ts, firewall_line(ts, rng, SINGLE_PORT_IP, 3389, "TCP")))
+
+    return entries
+
+
 def write_log(path: Path, entries: list[tuple[datetime, str]]) -> None:
     entries.sort(key=lambda e: e[0])
     path.write_text("\n".join(line for _, line in entries) + "\n", encoding="utf-8")
@@ -193,6 +272,7 @@ def main() -> None:
     OUTPUT_DIR.mkdir(exist_ok=True)
     write_log(OUTPUT_DIR / "auth.log", generate_auth_log(rng))
     write_log(OUTPUT_DIR / "access.log", generate_access_log(rng))
+    write_log(OUTPUT_DIR / "firewall.log", generate_firewall_log(random.Random(SEED + 2)))
 
 
 if __name__ == "__main__":

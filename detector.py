@@ -35,12 +35,18 @@ SCAN_WINDOW = timedelta(minutes=5)
 SCAN_ERROR_STATUSES = {403, 404}
 SCAN_MIN_ERROR_RATIO = 0.5  # "більшість" відповідей — 403/404
 
+# Розвідка: один IP стукає в багато різних портів (заблоковані firewall-ом)
+PORT_SCAN_MIN_PORTS = 10
+PORT_SCAN_WINDOW = timedelta(minutes=5)
+MAX_LISTED_PORTS = 20  # скільки портів показувати в details
+
 MAX_EXAMPLES = 3
 
 SEVERITY = {
     "brute_force": "High",
     "brute_force_success": "Critical",   # brute-force, після якого вхід успішний
     "path_scanning": "Medium",
+    "port_scanning": "Medium",
     "sqli": "High",
     "xss": "Medium",
 }
@@ -193,6 +199,30 @@ def path_scanning(events: list[dict]) -> list[dict]:
     return incidents
 
 
+def _ports(events: list[dict]) -> set[int]:
+    return {e["meta"]["dpt"] for e in events if e["meta"].get("dpt") is not None}
+
+
+def port_scanning(events: list[dict]) -> list[dict]:
+    """PORT_SCAN_MIN_PORTS+ різних портів призначення з одного IP за PORT_SCAN_WINDOW.
+
+    Рахуються заблоковані firewall-ом пакети (firewall_block). Багато спроб
+    в один порт — це не сканування (ним займається brute-force або шум).
+    """
+    blocks = [e for e in events if e["event_type"] == "firewall_block"]
+    incidents = []
+    for ip_events in _group_by_ip(blocks).values():
+        for burst in _find_bursts(ip_events, PORT_SCAN_WINDOW,
+                                  lambda w: len(_ports(w)) >= PORT_SCAN_MIN_PORTS):
+            ports = sorted(_ports(burst))
+            incidents.append(_make_incident("port_scanning", burst, {
+                "unique_ports": len(ports),
+                "ports": ports[:MAX_LISTED_PORTS],
+                "protocols": sorted({e["meta"]["proto"] for e in burst} - {None}),
+            }))
+    return incidents
+
+
 def _pattern_rule(rule: str, events: list[dict], patterns: dict[str, re.Pattern]) -> list[dict]:
     """Спільна логіка для правил-сигнатур: один інцидент на IP з усіма збігами."""
     matched_by_ip = defaultdict(list)
@@ -222,7 +252,7 @@ def xss(events: list[dict]) -> list[dict]:
     return _pattern_rule("xss", events, _XSS_RE)
 
 
-RULES = [brute_force, path_scanning, sqli, xss]
+RULES = [brute_force, path_scanning, port_scanning, sqli, xss]
 
 
 def detect(events: list[dict]) -> list[dict]:

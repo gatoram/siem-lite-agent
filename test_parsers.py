@@ -12,7 +12,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from parsers import ssh_parser, web_parser
+from parsers import firewall_parser, ssh_parser, web_parser
 
 LOGS_DIR = Path(__file__).parent / "sample_logs"
 # Реальний лог: вибірка OpenSSH_2k з Loghub (github.com/logpai/loghub)
@@ -32,18 +32,20 @@ def main() -> None:
 
     ssh_events = ssh_parser.parse_file(LOGS_DIR / "auth.log", year=LOG_YEAR)
     web_events = web_parser.parse_file(LOGS_DIR / "access.log")
-    events = ssh_events + web_events
+    fw_events = firewall_parser.parse_file(LOGS_DIR / "firewall.log", year=LOG_YEAR)
+    events = ssh_events + web_events + fw_events
 
     print("Кількість подій за event_type:")
     counts = Counter((e["log_source"], e["event_type"]) for e in events)
     for (source, event_type), n in sorted(counts.items()):
-        print(f"  {source:<4} {event_type:<14} {n}")
+        print(f"  {source:<8} {event_type:<14} {n}")
     print(f"  всього: {len(events)}")
 
     examples = [
         next(e for e in ssh_events if e["event_type"] == "login_success"),
         next(e for e in ssh_events if e["meta"]["invalid_user"]),
         next(e for e in web_events if "OR" in e["meta"]["query"]),
+        fw_events[0],
     ]
     print("\nПриклади подій:")
     for event in examples:
@@ -53,6 +55,7 @@ def main() -> None:
     # Кожен рядок логу має розпізнатись
     assert len(ssh_events) == count_lines(LOGS_DIR / "auth.log")
     assert len(web_events) == count_lines(LOGS_DIR / "access.log")
+    assert len(fw_events) == count_lines(LOGS_DIR / "firewall.log")
 
     # Brute-force: 30 невдалих спроб з 203.0.113.45 в межах 2 хвилин
     brute = [e for e in ssh_events if e["source_ip"] == "203.0.113.45"]
@@ -73,10 +76,55 @@ def main() -> None:
     # Нерозпізнані рядки повертають None, а не падають
     assert ssh_parser.parse_line("garbage") is None
     assert web_parser.parse_line("garbage") is None
+    assert firewall_parser.parse_line("garbage") is None
 
+    # Сканування портів: 25 різних портів з 198.51.100.200 (той самий IP, що й скан шляхів)
+    port_scan = [e for e in fw_events if e["source_ip"] == "198.51.100.200"]
+    assert len({e["meta"]["dpt"] for e in port_scan}) == 25
+    assert all(e["event_type"] == "firewall_block" for e in fw_events)
+
+    check_firewall_formats()
     check_real_ssh_log()
 
     print("\nУсі перевірки пройдено.")
+
+
+def check_firewall_formats() -> None:
+    """ufw і iptables з різними префіксами та протоколами."""
+    ufw = firewall_parser.parse_line(
+        "Sep 30 14:02:11 srv-web01 kernel: [86531.204117] [UFW BLOCK] IN=eth0 OUT= "
+        "MAC=52:54:00:12:34:56:52:54:00:65:43:21:08:00 SRC=1.2.3.4 DST=203.0.113.10 LEN=44 "
+        "TOS=0x00 PREC=0x00 TTL=52 ID=54321 PROTO=TCP SPT=51234 DPT=22 WINDOW=1024 RES=0x00 SYN URGP=0",
+        year=2026)
+    assert ufw["log_source"] == "firewall" and ufw["event_type"] == "firewall_block"
+    assert ufw["source_ip"] == "1.2.3.4" and ufw["timestamp"] == "2026-09-30T14:02:11"
+    assert ufw["meta"] == {"action": "UFW BLOCK", "proto": "TCP", "dpt": 22, "spt": 51234,
+                           "interface": "eth0", "dst": "203.0.113.10", "host": "srv-web01"}
+    # iptables з власним префіксом, без мітки uptime
+    ipt = firewall_parser.parse_line(
+        "Sep 30 14:02:12 gw kernel: IPTABLES-DROP: IN=ens3 OUT= SRC=5.6.7.8 DST=10.0.0.1 "
+        "LEN=40 PROTO=UDP SPT=5353 DPT=161 LEN=20", year=2026)
+    assert ipt["event_type"] == "firewall_block"
+    meta = ipt["meta"]
+    assert (meta["action"], meta["proto"], meta["dpt"], meta["interface"]) == ("IPTABLES-DROP", "UDP", 161, "ens3")
+    # ICMP — без портів
+    icmp = firewall_parser.parse_line(
+        "Sep 30 14:02:13 gw kernel: [1.0] [UFW BLOCK] IN=eth0 OUT= SRC=5.6.7.8 DST=10.0.0.1 "
+        "PROTO=ICMP TYPE=8 CODE=0 ID=1 SEQ=1", year=2026)
+    assert icmp["meta"]["proto"] == "ICMP" and icmp["meta"]["dpt"] is None
+    # ALLOW — окремий тип; AUDIT і не-netfilter рядки ядра пропускаються
+    allow = firewall_parser.parse_line(
+        "Sep 30 14:02:14 gw kernel: [1.0] [UFW ALLOW] IN=eth0 OUT= SRC=5.6.7.8 DST=10.0.0.1 "
+        "PROTO=TCP SPT=1 DPT=443", year=2026)
+    assert allow["event_type"] == "firewall_allow"
+    assert firewall_parser.parse_line(
+        "Sep 30 14:02:15 gw kernel: [1.0] [UFW AUDIT] IN=eth0 OUT= SRC=5.6.7.8 DST=10.0.0.1 "
+        "PROTO=TCP SPT=1 DPT=443", year=2026) is None
+    assert firewall_parser.parse_line("Sep 30 14:02:16 gw kernel: [1.0] eth0: link up", year=2026) is None
+    # Рядки sshd firewall-парсер не бере, і навпаки, тож автовизначення формату не плутається
+    ssh_line = "Sep 30 03:22:14 srv-web01 sshd[1234]: Failed password for root from 1.2.3.4 port 1 ssh2"
+    assert firewall_parser.parse_line(ssh_line, year=2026) is None
+    assert ssh_parser.parse_line(ufw["raw"], year=2026) is None
 
 
 def check_real_ssh_log() -> None:

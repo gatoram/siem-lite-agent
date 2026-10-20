@@ -5,3 +5,6 @@ rich>=13.7
 google-genai>=2.31
 requests>=2.32
 python-dotenv>=1.0
+
+# Веб-дашборд (dashboard.py)
+flask>=3.0

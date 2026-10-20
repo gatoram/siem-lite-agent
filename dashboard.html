@@ -1,0 +1,641 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SIEM-lite SOC</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%233987e5'/%3E%3Cpath d='M3 11l3-4 3 2 4-5' stroke='white' stroke-width='1.8' fill='none'/%3E%3C/svg%3E">
+<style nonce="__CSP_NONCE__">
+:root {
+  color-scheme: dark;
+  --bg: #0b0e13;
+  --panel: #11161f;
+  --panel-2: #161c27;
+  --panel-3: #1c2331;
+  --border: #222a38;
+  --border-strong: #2e3849;
+  --text: #d6dce6;
+  --text-2: #9aa4b5;
+  --muted: #6b7587;
+  --accent: #3987e5;
+  --crit: #d03b3b;
+  --crit-ink: #ff7b78;
+  --high: #ec835a;
+  --med: #fab219;
+  --low: #6b7a90;
+  --ok: #0ca30c;
+  --mono: ui-monospace, "Cascadia Mono", "JetBrains Mono", Consolas, "SF Mono", monospace;
+  --sans: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text); }
+body { font: 13px/1.4 var(--sans); min-height: 100vh; }
+.mono { font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums; }
+button, select { font: inherit; color: inherit; }
+
+/* ---------- top bar */
+.topbar {
+  display: flex; align-items: center; gap: 16px;
+  height: 44px; padding: 0 16px;
+  background: var(--panel); border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 5;
+}
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 600; letter-spacing: .02em; }
+.brand-mark {
+  width: 22px; height: 22px; border-radius: 4px;
+  background: linear-gradient(135deg, var(--accent), #1d4f8f);
+  display: grid; place-items: center; font: 700 11px var(--mono); color: #fff;
+}
+.brand small { color: var(--muted); font-weight: 400; letter-spacing: 0; }
+.topbar .spacer { flex: 1; }
+.status { display: flex; align-items: center; gap: 8px; color: var(--text-2); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.status.live .dot { background: var(--ok); box-shadow: 0 0 0 0 rgba(12,163,12,.6); animation: pulse 2s infinite; }
+.status.live .label { color: #5fd35f; }
+.status.idle .label { color: var(--text-2); }
+.status.offline .dot { background: var(--crit); }
+.status.offline .label { color: var(--crit-ink); }
+.label { font: 600 11px var(--mono); letter-spacing: .08em; }
+@keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(12,163,12,.55); } 70% { box-shadow: 0 0 0 7px rgba(12,163,12,0); } 100% { box-shadow: 0 0 0 0 rgba(12,163,12,0); } }
+
+main { padding: 12px 16px 24px; display: grid; gap: 12px; }
+
+/* ---------- panels */
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; min-width: 0; }
+.panel-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 12px; border-bottom: 1px solid var(--border);
+  font-size: 12px; font-weight: 600; color: var(--text-2); text-transform: uppercase; letter-spacing: .06em;
+}
+.panel-head .hint { margin-left: auto; text-transform: none; letter-spacing: 0; font-weight: 400; color: var(--muted); }
+
+/* ---------- stat tiles */
+.tiles { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }
+.tile { padding: 10px 14px 12px; position: relative; overflow: hidden; }
+.tile::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--tile-color, var(--border-strong)); }
+.tile-label { display: flex; align-items: center; gap: 6px; color: var(--text-2); font-size: 11px; text-transform: uppercase; letter-spacing: .07em; }
+.tile-value { font: 600 28px/1.15 var(--mono); margin-top: 4px; font-variant-numeric: tabular-nums; }
+.tile-sub { color: var(--muted); font-size: 11px; margin-top: 2px; }
+.tile.crit { --tile-color: var(--crit); }
+.tile.high { --tile-color: var(--high); }
+.tile.med { --tile-color: var(--med); }
+.tile.accent { --tile-color: var(--accent); }
+.tile.crit.nonzero { background: linear-gradient(90deg, rgba(208,59,59,.14), transparent 70%), var(--panel); }
+.tile.bump .tile-value { animation: bump .8s ease-out; }
+@keyframes bump { 0% { color: #fff; text-shadow: 0 0 12px rgba(255,255,255,.5); } 100% { text-shadow: none; } }
+
+/* ---------- severity glyph + badge (колір ніколи не єдиний носій сенсу) */
+.sev-icon { width: 10px; height: 10px; flex: none; display: inline-block; }
+.sev-icon.Critical { background: var(--crit); clip-path: polygon(50% 0, 100% 100%, 0 100%); }
+.sev-icon.High { background: var(--high); transform: rotate(45deg) scale(.8); }
+.sev-icon.Medium { background: var(--med); border-radius: 50%; }
+.sev-icon.Low { border: 2px solid var(--low); border-radius: 50%; }
+.badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 1px 7px 1px 6px; border-radius: 3px;
+  font: 600 11px/18px var(--mono); letter-spacing: .03em; white-space: nowrap;
+}
+.badge.Critical { background: var(--crit); color: #fff; }
+.badge.High { background: var(--high); color: #1a0c05; }
+.badge.Medium { background: var(--med); color: #1a1203; }
+.badge.Low { background: transparent; color: var(--text-2); box-shadow: inset 0 0 0 1px var(--low); }
+.badge .sev-icon { width: 8px; height: 8px; background: currentColor; border: 0; }
+.badge.Low .sev-icon { background: transparent; border: 2px solid currentColor; }
+
+/* ---------- charts row */
+.charts { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 12px; }
+.chart-wrap { position: relative; height: 170px; padding: 8px 12px 4px 4px; }
+.chart-wrap svg { display: block; width: 100%; height: 100%; overflow: visible; }
+.axis text { fill: var(--muted); font: 10px var(--mono); }
+.grid line { stroke: var(--border); stroke-width: 1; }
+.line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.area { fill: url(#areaFill); }
+.crosshair { stroke: var(--text-2); stroke-width: 1; stroke-dasharray: 3 3; }
+.marker { fill: var(--accent); stroke: var(--panel); stroke-width: 2; }
+.tooltip {
+  position: absolute; pointer-events: none; z-index: 3;
+  background: var(--panel-3); border: 1px solid var(--border-strong); border-radius: 4px;
+  padding: 6px 9px; font-size: 12px; white-space: nowrap; box-shadow: 0 4px 16px rgba(0,0,0,.4);
+}
+.tooltip .v { font: 600 14px var(--mono); }
+.tooltip .t { color: var(--text-2); }
+.empty { color: var(--muted); padding: 24px 12px; text-align: center; }
+
+.top-list { list-style: none; margin: 0; padding: 6px 12px 10px; display: grid; gap: 4px; }
+.top-item { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 5px 0; cursor: pointer; border-radius: 3px; }
+.top-item:hover .top-ip { color: #fff; }
+.top-rank { color: var(--muted); font: 11px var(--mono); text-align: right; }
+.top-main { min-width: 0; }
+.top-row { display: flex; align-items: center; gap: 6px; }
+.top-ip { font: 12px var(--mono); overflow: hidden; text-overflow: ellipsis; }
+.top-bar { height: 6px; margin-top: 4px; background: var(--panel-3); border-radius: 3px; overflow: hidden; }
+.top-bar span { display: block; height: 100%; background: var(--accent); border-radius: 0 3px 3px 0; }
+.top-count { font: 600 13px var(--mono); text-align: right; }
+.top-count small { display: block; font-weight: 400; color: var(--muted); font-size: 10px; }
+
+/* ---------- filters */
+.filters { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid var(--border); }
+.seg { display: inline-flex; border: 1px solid var(--border-strong); border-radius: 4px; overflow: hidden; }
+.seg button {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: transparent; border: 0; border-right: 1px solid var(--border-strong);
+  padding: 4px 10px; cursor: pointer; color: var(--text-2); font-size: 12px;
+}
+.seg button:last-child { border-right: 0; }
+.seg button:hover { background: var(--panel-2); color: var(--text); }
+.seg button[aria-pressed="true"] { background: var(--panel-3); color: var(--text); box-shadow: inset 0 -2px 0 var(--accent); }
+.filters label { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+.filters select {
+  background: var(--panel-2); border: 1px solid var(--border-strong); border-radius: 4px;
+  padding: 4px 8px; font-size: 12px; min-width: 130px;
+}
+.filters .count { margin-left: auto; color: var(--muted); font-size: 12px; }
+
+/* ---------- incidents table */
+.table-scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+thead th {
+  text-align: left; font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .06em;
+  padding: 7px 10px; border-bottom: 1px solid var(--border); background: var(--panel); white-space: nowrap;
+}
+th.num, td.num { text-align: right; }
+tbody tr.inc { cursor: pointer; border-bottom: 1px solid var(--border); }
+tbody tr.inc td { padding: 5px 10px; white-space: nowrap; vertical-align: middle; }
+tbody tr.inc td:first-child { box-shadow: inset 3px 0 0 var(--row-color, transparent); }
+tr.inc.Critical { --row-color: var(--crit); background: rgba(208,59,59,.10); }
+tr.inc.High { --row-color: var(--high); background: rgba(236,131,90,.07); }
+tr.inc.Medium { --row-color: var(--med); background: rgba(250,178,25,.05); }
+tr.inc.Low { --row-color: var(--low); }
+tr.inc:hover { background: var(--panel-3); }
+tr.inc.open { background: var(--panel-3); }
+tr.inc.fresh { animation: fresh 2.5s ease-out; }
+@keyframes fresh { 0% { background: rgba(57,135,229,.35); } 100% { } }
+.caret { display: inline-block; width: 10px; color: var(--muted); transition: transform .15s; }
+tr.open .caret { transform: rotate(90deg); color: var(--text); }
+.rule { font-weight: 500; }
+.src { color: var(--text-2); font: 11px var(--mono); text-transform: uppercase; padding: 1px 5px; border: 1px solid var(--border-strong); border-radius: 3px; }
+.threat { color: var(--text-2); max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
+.ai-tag { font: 10px var(--mono); color: var(--accent); border: 1px solid rgba(57,135,229,.45); border-radius: 3px; padding: 0 4px; }
+.no-ai { color: var(--muted); font-size: 11px; }
+.sev-change { color: var(--muted); font: 11px var(--mono); margin-left: 4px; }
+
+/* ---------- incident details */
+tr.detail > td { padding: 0; background: #0d1118; border-bottom: 1px solid var(--border-strong); }
+.detail-grid { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr) minmax(0, 1fr); gap: 1px; background: var(--border); }
+.detail-grid > section { background: #0d1118; padding: 10px 14px 14px; min-width: 0; }
+.detail-grid h3 { margin: 0 0 8px; font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .07em; }
+.raw {
+  margin: 0 0 4px; padding: 6px 8px; background: #080b10; border: 1px solid var(--border); border-left: 2px solid var(--row-color, var(--border-strong)); border-radius: 3px;
+  font: 11.5px/1.5 var(--mono); color: #c9d1dc; white-space: pre-wrap; word-break: break-all;
+}
+.kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 3px 12px; margin: 8px 0 0; font-size: 12px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; overflow-wrap: anywhere; }
+.chain { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.step { position: relative; padding-left: 16px; }
+.step::before { content: ""; position: absolute; left: 4px; top: 6px; bottom: -10px; width: 1px; background: var(--border-strong); }
+.step:last-child::before { display: none; }
+.step::after { content: ""; position: absolute; left: 1px; top: 4px; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
+.step.verdict::after { background: var(--text-2); }
+.call { font: 12px var(--mono); color: #9cc7ff; overflow-wrap: anywhere; }
+.call .fn { color: #7fb4ff; font-weight: 600; }
+.ret { margin-top: 4px; }
+.ret .kv { margin-top: 2px; font: 11.5px var(--mono); }
+.ret .kv dt::before { content: "← "; color: var(--muted); }
+.score-hi { color: var(--crit-ink); font-weight: 600; }
+.verdict-text p { margin: 0 0 10px; overflow-wrap: anywhere; }
+.verdict-text .k { display: block; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 2px; }
+.note { padding: 6px 8px; border-radius: 3px; background: rgba(250,178,25,.08); border: 1px solid rgba(250,178,25,.3); color: #f3d38a; font-size: 12px; margin-bottom: 10px; }
+.model { color: var(--muted); font: 11px var(--mono); }
+.dim { color: var(--muted); }
+
+@media (max-width: 1100px) {
+  .tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .charts, .detail-grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 640px) {
+  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .topbar .brand small, .filters .count { display: none; }
+}
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><div class="brand-mark">SL</div>SIEM-lite <small>SOC console</small></div>
+  <div class="spacer"></div>
+  <div class="status mono" id="lastData"></div>
+  <div class="status idle" id="status"><span class="dot"></span><span class="label" id="statusLabel">…</span></div>
+</header>
+
+<main>
+  <section class="tiles">
+    <div class="panel tile accent" id="tile-events"><div class="tile-label">Подій оброблено</div><div class="tile-value">–</div><div class="tile-sub">рядків логу в history.db</div></div>
+    <div class="panel tile" id="tile-incidents"><div class="tile-label">Інцидентів усього</div><div class="tile-value">–</div><div class="tile-sub" id="tile-incidents-sub">&nbsp;</div></div>
+    <div class="panel tile crit" id="tile-Critical"><div class="tile-label"><span class="sev-icon Critical"></span>Critical</div><div class="tile-value">–</div><div class="tile-sub">злам / негайна реакція</div></div>
+    <div class="panel tile high" id="tile-High"><div class="tile-label"><span class="sev-icon High"></span>High</div><div class="tile-value">–</div><div class="tile-sub">активна атака</div></div>
+    <div class="panel tile med" id="tile-Medium"><div class="tile-label"><span class="sev-icon Medium"></span>Medium</div><div class="tile-value">–</div><div class="tile-sub">розвідка, сканування</div></div>
+  </section>
+
+  <section class="charts">
+    <div class="panel">
+      <div class="panel-head">Події в часі <span class="hint" id="timelineHint">за часом надходження, кошик 10 с</span></div>
+      <div class="chart-wrap" id="chart"></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head">Топ-5 IP-атакуючих <span class="hint">за кількістю інцидентів</span></div>
+      <ol class="top-list" id="topIps"></ol>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">Інциденти <span class="hint">клік на рядок: сирі логи, tool calls агента, висновок</span></div>
+    <div class="filters">
+      <div class="seg" id="sevFilter" role="group" aria-label="Severity"></div>
+      <label>Правило <select id="ruleFilter"><option value="">усі</option></select></label>
+      <label>Джерело <select id="sourceFilter"><option value="">усі</option></select></label>
+      <span class="count" id="incCount"></span>
+    </div>
+    <div class="table-scroll">
+      <table>
+        <thead><tr>
+          <th>Severity</th><th>Виявлено</th><th>Правило</th><th>Джерело</th><th>IP</th>
+          <th class="num">Подій</th><th>Перша подія → остання</th><th>Тип загрози (AI)</th><th>AI</th>
+        </tr></thead>
+        <tbody id="incidents"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script nonce="__CSP_NONCE__">
+"use strict";
+// Усе, що прийшло з логів або від моделі, потрапляє в DOM лише як текст:
+// el() перетворює рядки на текстові вузли; розбору рядків як HTML на сторінці немає.
+
+const REFRESH_MS = 3000;
+const LIVE_WITHIN_S = 15;
+const SEVERITIES = ["Critical", "High", "Medium", "Low"];
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+const state = {
+  filters: { severity: "", rule: "", source: "" },
+  openId: null,
+  detailCache: new Map(),   // id -> {updated_at, node}
+  seenIds: null,            // null до першого завантаження: тоді нічого не підсвічуємо
+  prevTiles: {},
+};
+
+function el(tag, attrs, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs || {})) {
+    if (value === null || value === undefined || value === false) continue;
+    if (key === "class") node.className = value;
+    else if (key === "text") node.textContent = value;
+    else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+    else node.setAttribute(key, value);
+  }
+  for (const child of children.flat()) {
+    if (child === null || child === undefined || child === false) continue;
+    node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+  }
+  return node;
+}
+
+function svg(tag, attrs) {
+  const node = document.createElementNS(SVG_NS, tag);
+  for (const [key, value] of Object.entries(attrs || {})) node.setAttribute(key, value);
+  return node;
+}
+
+function sevBadge(severity) {
+  const sev = SEVERITIES.includes(severity) ? severity : "Low";
+  return el("span", { class: `badge ${sev}` }, el("span", { class: `sev-icon ${sev}` }), String(severity ?? "?"));
+}
+
+// "2026-09-30T03:22:14" -> "09-30 03:22:14"
+function shortTs(iso) { return iso ? String(iso).replace("T", " ").slice(5, 19) : "–"; }
+function clockTs(iso) { return iso ? String(iso).slice(11, 19) : "–"; }
+function fmt(n) { return Number(n || 0).toLocaleString("uk-UA"); }
+
+async function getJSON(url) {
+  const resp = await fetch(url, { cache: "no-store" });
+  if (!resp.ok) throw new Error(`${url}: HTTP ${resp.status}`);
+  return resp.json();
+}
+
+// ---------------------------------------------------------------- tiles & status
+
+function setTile(id, value, sub) {
+  const tile = document.getElementById(id);
+  const text = fmt(value);
+  const valueNode = tile.querySelector(".tile-value");
+  if (state.prevTiles[id] !== undefined && state.prevTiles[id] !== text) {
+    tile.classList.remove("bump"); void tile.offsetWidth; tile.classList.add("bump");
+  }
+  state.prevTiles[id] = text;
+  valueNode.textContent = text;
+  if (sub !== undefined) tile.querySelector(".tile-sub").textContent = sub;
+  tile.classList.toggle("nonzero", Number(value) > 0);
+}
+
+function renderSummary(s) {
+  setTile("tile-events", s.events);
+  const low = s.by_severity.Low || 0;
+  setTile("tile-incidents", s.incidents, low ? `з них Low: ${low}` : " ");
+  for (const sev of ["Critical", "High", "Medium"]) setTile(`tile-${sev}`, s.by_severity[sev] || 0);
+
+  const age = s.last_ingested ? (Date.parse(s.server_time) - Date.parse(s.last_ingested)) / 1000 : Infinity;
+  setStatus(age <= LIVE_WITHIN_S ? "live" : "idle", age <= LIVE_WITHIN_S ? "LIVE" : "IDLE");
+  document.getElementById("lastData").textContent =
+    s.last_ingested ? `остання подія ${shortTs(s.last_ingested)} · оновлено ${clockTs(s.server_time)}` : "подій ще немає";
+
+  fillSelect("ruleFilter", s.rules, "rule");
+  fillSelect("sourceFilter", s.sources, "source");
+}
+
+function setStatus(kind, label) {
+  document.getElementById("status").className = `status ${kind}`;
+  document.getElementById("statusLabel").textContent = label;
+}
+
+function fillSelect(id, values, key) {
+  const select = document.getElementById(id);
+  const wanted = ["", ...values];
+  if (state.filters[key] && !wanted.includes(state.filters[key])) wanted.push(state.filters[key]);
+  const current = [...select.options].map(o => o.value);
+  if (current.join("\n") === wanted.join("\n")) return;
+  select.replaceChildren(...wanted.map(v => el("option", { value: v, text: v || "усі" })));
+  select.value = state.filters[key];
+}
+
+// ---------------------------------------------------------------- timeline chart
+
+function renderTimeline(data) {
+  const wrap = document.getElementById("chart");
+  const points = data.points;
+  const total = points.reduce((a, p) => a + p.count, 0);
+  if (!points.length || total === 0) {
+    wrap.replaceChildren(el("div", { class: "empty", text: "За останні 15 хв подій не надходило" }));
+    return;
+  }
+  const W = wrap.clientWidth - 16, H = wrap.clientHeight - 12;
+  const m = { l: 34, r: 8, t: 8, b: 20 };
+  const iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const maxY = niceMax(Math.max(...points.map(p => p.count)));
+  const x = i => m.l + (points.length === 1 ? iw / 2 : (i / (points.length - 1)) * iw);
+  const y = v => m.t + ih - (v / maxY) * ih;
+
+  const root = svg("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "Події в часі" });
+  const defs = svg("defs");
+  const grad = svg("linearGradient", { id: "areaFill", x1: 0, y1: 0, x2: 0, y2: 1 });
+  grad.append(svg("stop", { offset: "0%", "stop-color": "#3987e5", "stop-opacity": "0.28" }),
+              svg("stop", { offset: "100%", "stop-color": "#3987e5", "stop-opacity": "0" }));
+  defs.append(grad);
+  root.append(defs);
+
+  const grid = svg("g", { class: "grid" }), axis = svg("g", { class: "axis" });
+  for (let k = 0; k <= 4; k++) {
+    const v = (maxY / 4) * k, yy = y(v);
+    grid.append(svg("line", { x1: m.l, x2: m.l + iw, y1: yy, y2: yy }));
+    const t = svg("text", { x: m.l - 6, y: yy + 3, "text-anchor": "end" });
+    t.textContent = Number.isInteger(v) ? v : v.toFixed(1);
+    axis.append(t);
+  }
+  const ticks = 6;
+  for (let k = 0; k <= ticks; k++) {
+    const i = Math.round((points.length - 1) * k / ticks);
+    const t = svg("text", { x: x(i), y: H - 4, "text-anchor": k === 0 ? "start" : k === ticks ? "end" : "middle" });
+    t.textContent = clockTs(points[i].t).slice(0, 5);
+    axis.append(t);
+  }
+  root.append(grid, axis);
+
+  const d = points.map((p, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(p.count).toFixed(1)}`).join("");
+  root.append(svg("path", { class: "area", d: `${d}L${x(points.length - 1)},${y(0)}L${x(0)},${y(0)}Z` }));
+  root.append(svg("path", { class: "line", d }));
+
+  const cross = svg("line", { class: "crosshair", y1: m.t, y2: m.t + ih, visibility: "hidden" });
+  const marker = svg("circle", { class: "marker", r: 4.5, visibility: "hidden" });
+  const hit = svg("rect", { x: m.l, y: 0, width: iw, height: H, fill: "transparent" });
+  root.append(cross, marker, hit);
+
+  const tip = el("div", { class: "tooltip", hidden: "" });
+  hit.addEventListener("mousemove", ev => {
+    const box = root.getBoundingClientRect();
+    const px = (ev.clientX - box.left) * (W / box.width);
+    const i = Math.max(0, Math.min(points.length - 1, Math.round(((px - m.l) / iw) * (points.length - 1))));
+    const p = points[i];
+    cross.setAttribute("x1", x(i)); cross.setAttribute("x2", x(i)); cross.setAttribute("visibility", "visible");
+    marker.setAttribute("cx", x(i)); marker.setAttribute("cy", y(p.count)); marker.setAttribute("visibility", "visible");
+    tip.replaceChildren(el("div", { class: "v", text: `${p.count} подій` }),
+                        el("div", { class: "t mono", text: `${clockTs(p.t)} + ${data.bucket_seconds} с` }));
+    tip.hidden = false;
+    const left = (x(i) / W) * box.width;
+    tip.style.left = `${Math.min(left + 12, box.width - 130)}px`;
+    tip.style.top = `${Math.max(0, (y(p.count) / H) * box.height - 46)}px`;
+  });
+  hit.addEventListener("mouseleave", () => {
+    tip.hidden = true; cross.setAttribute("visibility", "hidden"); marker.setAttribute("visibility", "hidden");
+  });
+  wrap.replaceChildren(root, tip);
+  document.getElementById("timelineHint").textContent =
+    `за часом надходження, кошик ${data.bucket_seconds} с · за вікно ${fmt(total)}`;
+}
+
+function niceMax(v) {
+  if (v <= 4) return 4;
+  const p = 10 ** Math.floor(Math.log10(v));
+  for (const s of [1, 2, 2.5, 5, 10]) if (s * p >= v) return s * p;
+  return 10 * p;
+}
+
+// ---------------------------------------------------------------- top IPs
+
+function renderTopIps(rows) {
+  const list = document.getElementById("topIps");
+  if (!rows.length) { list.replaceChildren(el("li", { class: "empty", text: "Інцидентів ще немає" })); return; }
+  const max = Math.max(...rows.map(r => r.incidents));
+  list.replaceChildren(...rows.map((r, i) => {
+    const bar = el("span");
+    bar.style.width = `${Math.max(4, (r.incidents / max) * 100)}%`;
+    return el("li", { class: "top-item", title: "Показати інциденти з цього IP у таблиці", onclick: () => focusIp(r.source_ip) },
+      el("span", { class: "top-rank", text: String(i + 1) }),
+      el("div", { class: "top-main" },
+        el("div", { class: "top-row" }, el("span", { class: `sev-icon ${r.max_severity}`, title: `макс. severity: ${r.max_severity}` }),
+                                         el("span", { class: "top-ip", text: r.source_ip })),
+        el("div", { class: "top-bar" }, bar)),
+      el("div", { class: "top-count" }, String(r.incidents), el("small", { text: `${fmt(r.events)} подій` })));
+  }));
+}
+
+function focusIp(ip) {
+  const row = [...document.querySelectorAll("tr.inc")].find(tr => tr.dataset.ip === ip);
+  if (row) { row.scrollIntoView({ block: "center", behavior: "smooth" }); toggle(Number(row.dataset.id), true); }
+}
+
+// ---------------------------------------------------------------- incidents table
+
+function renderIncidents(rows) {
+  const tbody = document.getElementById("incidents");
+  document.getElementById("incCount").textContent = `показано ${rows.length}`;
+  const firstLoad = state.seenIds === null;
+  const seen = state.seenIds || new Set();
+  const out = [];
+  if (!rows.length) {
+    out.push(el("tr", {}, el("td", { colspan: 9, class: "empty", text: "Немає інцидентів за цими фільтрами" })));
+  }
+  for (const r of rows) {
+    const sev = SEVERITIES.includes(r.severity) ? r.severity : "Low";
+    const open = state.openId === r.id;
+    const changed = r.agent_severity && r.agent_severity !== r.detector_severity;
+    const tr = el("tr", {
+        class: `inc ${sev}${open ? " open" : ""}${!firstLoad && !seen.has(r.id) ? " fresh" : ""}`,
+        "data-id": r.id, "data-ip": r.source_ip, tabindex: 0, "aria-expanded": String(open),
+        onclick: () => toggle(r.id),
+        onkeydown: ev => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); toggle(r.id); } } },
+      el("td", {}, el("span", { class: "caret", text: "▸" }), " ", sevBadge(r.severity)),
+      el("td", { class: "mono dim", text: shortTs(r.detected_at) }),
+      el("td", { class: "rule", text: r.rule }),
+      el("td", {}, el("span", { class: "src", text: r.log_source })),
+      el("td", { class: "mono", text: r.source_ip }),
+      el("td", { class: "num mono", text: fmt(r.event_count) }),
+      el("td", { class: "mono" }, shortTs(r.first_seen), el("span", { class: "dim", text: " → " }), shortTs(r.last_seen).slice(6)),
+      el("td", { class: "threat", title: r.threat_type || "", text: r.threat_type || "" },
+        changed ? el("span", { class: "sev-change", text: `детектор ${r.detector_severity}` }) : null),
+      el("td", {}, r.agent_severity ? el("span", { class: "ai-tag", text: "AI" }) : el("span", { class: "no-ai", text: "—" })));
+    out.push(tr);
+    if (open) out.push(detailRow(r));
+    seen.add(r.id);
+  }
+  state.seenIds = seen;
+  tbody.replaceChildren(...out);
+}
+
+function detailRow(r) {
+  const td = el("td", { colspan: 9 });
+  const tr = el("tr", { class: `detail ${r.severity}` }, td);
+  const cached = state.detailCache.get(r.id);
+  if (cached) td.append(cached.node);   // той самий вузол: прокрутка й виділення тексту не губляться
+  if (!cached || cached.updated_at !== r.updated_at) {
+    if (!cached) td.append(el("div", { class: "empty", text: "Завантаження…" }));
+    getJSON(`/api/incidents/${r.id}`).then(full => {
+      const node = buildDetail(full);
+      state.detailCache.set(r.id, { updated_at: full.updated_at, node });
+      if (td.isConnected) td.replaceChildren(node);
+    }).catch(err => td.replaceChildren(el("div", { class: "empty", text: `Помилка: ${err.message}` })));
+  }
+  return tr;
+}
+
+function toggle(id, forceOpen) {
+  state.openId = (state.openId === id && !forceOpen) ? null : id;
+  history.replaceState(null, "", state.openId ? `#incident=${state.openId}` : location.pathname);
+  refreshIncidents();
+}
+
+function buildDetail(d) {
+  // --- сирі рядки логу
+  const raw = el("section", {}, el("h3", { text: `Приклади сирих рядків логу (${(d.examples || []).length})` }));
+  for (const line of d.examples || []) raw.append(el("pre", { class: "raw", text: line }));
+  const kv = el("dl", { class: "kv" });
+  const addKv = (k, v, mono) => kv.append(el("dt", { text: k }), el("dd", { class: mono ? "mono" : null, text: v }));
+  addKv("IP", d.source_ip, true);
+  addKv("Правило", d.rule);
+  addKv("Подій", fmt(d.event_count), true);
+  addKv("Період", `${shortTs(d.first_seen)} → ${shortTs(d.last_seen)}`, true);
+  for (const [k, v] of Object.entries(d.details || {})) addKv(k, Array.isArray(v) ? v.join(", ") : (typeof v === "object" && v !== null ? JSON.stringify(v) : String(v)), true);
+  raw.append(kv);
+
+  // --- ланцюжок tool calls
+  const chain = el("ol", { class: "chain" });
+  const calls = d.tool_calls || [];
+  if (!d.agent_severity) {
+    chain.append(el("li", { class: "dim", text: "AI-аналізу не було (запуск без --ai або вичерпано --max-ai)." }));
+  } else if (!calls.length) {
+    chain.append(el("li", { class: "step verdict dim", text: "Агент вирішив не перевіряти репутацію IP." }));
+  }
+  for (const c of calls) {
+    const args = Object.entries(c.args || {}).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(", ");
+    const ret = el("dl", { class: "kv" });
+    const result = c.result && typeof c.result === "object" ? c.result : { result: c.result };
+    for (const [k, v] of Object.entries(result)) {
+      const hi = k === "abuseConfidenceScore" && Number(v) >= 50;
+      ret.append(el("dt", { text: k }), el("dd", { class: hi ? "score-hi" : null, text: v === null ? "null" : String(v) }));
+    }
+    chain.append(el("li", { class: "step" },
+      el("div", { class: "call" }, el("span", { class: "fn", text: c.name }), `(${args})`),
+      el("div", { class: "ret" }, ret)));
+  }
+  if (d.agent_severity) {
+    chain.append(el("li", { class: "step verdict" }, el("span", { class: "dim", text: "висновок → " }),
+      sevBadge(d.agent_severity), el("span", { class: "dim", text: `  (детектор: ${d.detector_severity})` })));
+  }
+  const tools = el("section", {}, el("h3", { text: `Ланцюжок агента · tool calls: ${calls.length}` }), chain);
+
+  // --- висновок
+  const verdict = el("section", { class: "verdict-text" }, el("h3", { text: "Висновок AI-агента" }));
+  if (d.agent_severity) {
+    if (d.severity_note) verdict.append(el("div", { class: "note", text: `⚠ ${d.severity_note}` }));
+    verdict.append(
+      el("p", {}, el("span", { class: "k", text: "Тип загрози" }), d.threat_type || "—"),
+      el("p", {}, el("span", { class: "k", text: "Пояснення" }), d.explanation || "—"),
+      el("p", {}, el("span", { class: "k", text: "Рекомендація" }), d.recommendation || "—"),
+      el("div", { class: "model", text: d.model || "" }));
+  } else {
+    verdict.append(el("p", { class: "dim", text: "Оцінка лише детектора. Для висновку агента запусти main.py з --ai." }));
+  }
+  const grid = el("div", { class: "detail-grid" }, raw, tools, verdict);
+  grid.style.setProperty("--row-color", `var(--${{ Critical: "crit", High: "high", Medium: "med" }[d.severity] || "low"})`);
+  return grid;
+}
+
+// ---------------------------------------------------------------- filters
+
+function buildSeverityFilter() {
+  const seg = document.getElementById("sevFilter");
+  for (const sev of ["", ...SEVERITIES]) {
+    const btn = el("button", { type: "button", "aria-pressed": String(state.filters.severity === sev),
+        onclick: () => {
+          state.filters.severity = sev;
+          for (const b of seg.children) b.setAttribute("aria-pressed", String(b === btn));
+          refreshIncidents();
+        } },
+      sev ? el("span", { class: `sev-icon ${sev}` }) : null, sev || "Усі");
+    seg.append(btn);
+  }
+  for (const [id, key] of [["ruleFilter", "rule"], ["sourceFilter", "source"]]) {
+    document.getElementById(id).addEventListener("change", ev => { state.filters[key] = ev.target.value; refreshIncidents(); });
+  }
+}
+
+// ---------------------------------------------------------------- refresh loop
+
+async function refreshIncidents() {
+  const q = new URLSearchParams(Object.entries(state.filters).filter(([, v]) => v));
+  renderIncidents(await getJSON(`/api/incidents?${q}`));
+}
+
+async function refresh() {
+  try {
+    const [summary, timeline, top] = await Promise.all(
+      [getJSON("/api/summary"), getJSON("/api/timeline"), getJSON("/api/top_ips")]);
+    renderSummary(summary);
+    renderTimeline(timeline);
+    renderTopIps(top);
+    await refreshIncidents();
+  } catch (err) {
+    setStatus("offline", "OFFLINE");
+    document.getElementById("lastData").textContent = "немає зв'язку з dashboard.py";
+    console.error(err);
+  } finally {
+    setTimeout(refresh, REFRESH_MS);
+  }
+}
+
+const deepLink = /^#incident=(\d+)$/.exec(location.hash);
+if (deepLink) state.openId = Number(deepLink[1]);
+buildSeverityFilter();
+refresh();
+</script>
+</body>
+</html>

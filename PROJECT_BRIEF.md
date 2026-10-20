@@ -15,7 +15,7 @@
 ## Архітектура
 
 ```
-[SSH / Web / Firewall логи] → [Парсер] → [Rule-based детектор] → [AI-агент + VirusTotal/AbuseIPDB tool use] → [Telegram-алерт + звіт]
+[SSH / Web / Firewall логи] → [Парсер] → [Rule-based детектор] → [AI-агент + VirusTotal/AbuseIPDB tool use] → [Telegram-алерт + звіт] → [веб-дашборд]
 ```
 
 Усі джерела логів (SSH auth.log, web access.log, firewall ufw/iptables)
@@ -153,6 +153,33 @@ spt, interface, dst, action (префікс LOG-правила, напр. `UFW B
    `--attack-after` с — brute-force з 203.0.113.99 з успішним входом admin,
    через `--sqli-after` с — SQLi з 192.0.2.150.
 
+8. **Веб-дашборд** (`dashboard.py` + `dashboard.html`) — SOC-консоль у
+   браузері: `py -3 dashboard.py` → http://127.0.0.1:8000 (слухає лише
+   127.0.0.1; `--db` — інша база). Дашборд нічого не аналізує, а лише читає
+   `history.db`: batch і live пишуть туди не тільки події, а й інциденти з
+   висновками агента (таблиця `incidents`, `History.store_incident`; ключ
+   rule + source_ip + first_seen). Повторний запис оновлює кількість подій і
+   last_seen, severity не знижує, а висновок агента замінює лише новий
+   висновок. Підсумкова `severity` — вища з детектора й агента. База у WAL,
+   тож читання не блокує запис live.
+
+   Flask віддає одну HTML-сторінку і JSON-ендпоінти (`/api/summary`,
+   `/api/incidents` з фільтрами severity/rule/source, `/api/incidents/<id>`,
+   `/api/timeline`, `/api/top_ips`); сторінка опитує їх кожні 3 с. На екрані:
+   картки (подій, інцидентів, Critical/High/Medium), графік подій за часом
+   надходження в базу (кошики по 10 с за 15 хв; час із самих логів не
+   годиться, бо SSH місцевий, а web — UTC), топ-5 IP за кількістю
+   інцидентів, таблиця інцидентів (найновіші зверху, колір і значок
+   severity). Клік на рядок розкриває сирі рядки логу, ланцюжок tool calls
+   агента з відповіддю AbuseIPDB, пояснення й рекомендацію.
+
+   Безпека: логи пише атакуючий, тому дані з логів і від моделі виводяться
+   лише як текст (`textContent`, без `innerHTML`). Content-Security-Policy
+   дозволяє лише скрипт і стилі з nonce цієї відповіді, тож навіть пропущена
+   HTML-вставка не виконає `<script>` чи `onerror=`. `test_dashboard.py`
+   перевіряє це в headless Edge/Chrome (`--dump-dom`): payload
+   `<script>alert(1)</script>` з access.log показано як текст.
+
 ## Стек
 
 - Python 3.11+
@@ -162,6 +189,7 @@ spt, interface, dst, action (префікс LOG-правила, напр. `UFW B
 - `requests` (Telegram Bot API, AbuseIPDB)
 - `python-dotenv` (ключі з `.env`, не в репозиторії)
 - `rich` (форматований консольний вивід у `main.py`)
+- `flask` (веб-дашборд, лише читає `history.db`)
 
 Залежності фіксуються в `requirements.txt` у міру того, як починають
 використовуватись у коді: `py -3 -m pip install -r requirements.txt`.
@@ -184,13 +212,14 @@ spt, interface, dst, action (префікс LOG-правила, напр. `UFW B
 
 **Після Milestone 2:**
 - Третє джерело логів: firewall (ufw/iptables), правило port_scanning
+- Веб-дашборд (SOC-консоль) поверх `history.db`
 
 ## Що НЕ входить у скоуп (щоб не розпорошуватись)
 
 - Реальна production-інфраструктура — тільки синтетичні/тестові логи
 - ML-модель для детекції аномалій — лишається rule-based (можна згадати як
   напрямок розвитку в кінці презентації)
-- Веб-дашборд — опційно, якщо залишиться час після Milestone 2
+- Аутентифікація й доступ до дашборду ззовні — він слухає лише 127.0.0.1
 
 ## Перший крок
 

@@ -284,3 +284,58 @@ parsers/web_parser.py, що перетворюють рядки з sample_logs �
   - port_scanning рахує лише `firewall_block`: дозволені з'єднання (80/443) ufw за замовчуванням не логує, а легітимні клієнти ходять саме туди.
   - Не підтримано: формат RFC 3339 (`2026-09-30T14:02:11.123+00:00 host kernel: ...`), який новий rsyslog у Ubuntu пише за замовчуванням (ssh_parser його теж не підтримує). Також змішаний `/var/log/syslog`, де в одному файлі і sshd, і kernel: формат визначається один на файл.
 - Файли: `parsers/firewall_parser.py`, `sample_logs/firewall.log` (створено); `parsers/__init__.py`, `detector.py`, `main.py`, `live.py`, `history.py`, `agent.py`, `generate_logs.py`, `test_parsers.py`, `test_detector.py`, `PROJECT_BRIEF.md`, `NOTES.md` (змінено)
+
+## [2026-10-20] Веб-дашборд (SOC-консоль) на Flask
+- Промпт: Зроби веб-дашборд для SIEM-lite. Спочатку застосуй навик frontend-design
+  для якісного візуального оформлення.
+
+  Архітектура:
+  - live і batch записують у history.db не лише події, а й інциденти з
+    висновками AI-агента (нова таблиця incidents: rule, source_ip, severity
+    детектора й агента, threat_type, пояснення, рекомендація, tool_calls,
+    first_seen, last_seen, event_count). Дашборд лише читає з бази, нічого
+    сам не аналізує
+  - Бекенд на Flask (простіший), фронтенд одна HTML-сторінка, оновлюється
+    сама кожні 3 секунди через fetch до JSON-ендпоінтів
+  - Запуск: py -3 dashboard.py, слухає тільки 127.0.0.1:8000
+
+  Що показує:
+  - Верхній ряд карток: подій оброблено, інцидентів усього, окремо Critical,
+    High, Medium
+  - Таблиця інцидентів, найновіші зверху, колір рядка за severity, фільтри
+    за severity, правилом і джерелом логів
+  - Клік на інцидент розкриває деталі: приклади сирих рядків логу, ланцюжок
+    tool calls агента (що запитав, що повернув AbuseIPDB), пояснення і
+    рекомендація
+  - Графік подій у часі (проста лінія) і топ-5 IP-атакуючих за кількістю
+    інцидентів
+
+  Дизайн:
+  - Темна тема, стиль SOC-консолі (орієнтир — Grafana/Kibana), компактно,
+    багато даних на екрані
+  - Severity кольорами: Critical червоний, High помаранчевий, Medium жовтий
+  - Моноширинний шрифт для IP, часу й рядків логу; звичайний для решти
+
+  Безпека (ОБОВ'ЯЗКОВО):
+  - Усі дані з логів і від моделі виводити ЛИШЕ як текст, ніколи як HTML.
+    Логи пише атакуючий, і XSS із логу (<script>, onerror=) не повинен
+    виконатись у дашборді. На фронтенді використовуй textContent, не innerHTML
+  - Напиши test_dashboard.py: подія з payload <script>alert(1)</script> в
+    access.log має віддаватись ендпоінтом і показуватись як текст, не як тег
+
+  Онови PROJECT_BRIEF.md і requirements.txt. Перевір, що дашборд оновлюється
+  наживо, поки паралельно працюють main.py live і simulate_attack.py.
+- Що зроблено:
+  - `history.py`: таблиця `incidents` (детекторна й агентна severity, підсумкова severity як вища з двох, threat_type, пояснення, рекомендація, tool_calls, сирі приклади, details, first/last_seen, event_count, detected_at/updated_at) і `store_incident()` з upsert за rule + IP + first_seen. Запис без AI не стирає висновок агента, severity і лічильники не зменшуються. У `events` додано `ingested_at` (міграція старої бази через ALTER TABLE). База переведена в WAL, щоб дашборд читав, поки live пише.
+  - `main.py`: batch записує всі показані інциденти з висновками, live — кожен новий/ескалований з аналізом, і на кожному проході оновлює кількість подій відомих інцидентів.
+  - `dashboard.py` (Flask, 127.0.0.1:8000, read-only з'єднання з базою): `/`, `/api/summary`, `/api/incidents` (фільтри severity/rule/source), `/api/incidents/<id>`, `/api/timeline`, `/api/top_ips`. `dashboard.html`: темна SOC-консоль, картки, лінійний графік з crosshair-підказкою, топ-5 IP, таблиця з кольором і значком severity, розкриття деталей (сирі рядки, ланцюжок tool calls з відповіддю AbuseIPDB, висновок), посилання `#incident=ID`. Увесь DOM будується через createElement/textContent. CSP з nonce на кожну відповідь, без `unsafe-inline`.
+  - `test_dashboard.py`: upsert, payload `<script>alert(1)</script>` у URL і `<img src=x onerror=...>` у User-Agent access.log віддаються API дослівно; у сторінці немає innerHTML/outerHTML/insertAdjacentHTML/document.write; headless Edge (`--dump-dom`, розкритий інцидент) показує payload як `&lt;script&gt;`, елементів `<script>`/`<img>` з payload немає, document.title не змінено. Перевірив, що тест ловить помилку: копія сторінки з innerHTML для сирих рядків тест не проходить.
+- Результат live-перевірки (dashboard + `main.py live --dry-run` + `simulate_attack.py`): сторінку відкрито один раз у headless Edge, DOM читався через CDP кожні 4 с. Лічильник подій ріс 1545 → 1613. Brute-force з 203.0.113.99 з'явився першим рядком о 16:30:50 (live виявив о 16:30:45), кількість подій у рядку росла 17 → 20 → 21. SQLi з'явився о 16:31:10 (live о 16:31:08). Статус LIVE, графік і топ-5 оновлювались. Розкритий інцидент показав 3 сирі рядки (останній Accepted password for admin), check_ip_reputation з відповіддю (score 87) і висновок.
+- Проблеми і як вирішено:
+  - Навику frontend-design у сесії немає. Для графіка, карток і кольорів severity використано навик dataviz (статусна палітра: critical #d03b3b, serious #ec835a, warning #fab219; severity завжди колір + значок-форма + текст).
+  - Графік за часом із логів не працює: SSH-час місцевий, web — UTC, тож web-події випали б з вікна "останні 15 хв". Тому графік рахує час надходження в базу (`ingested_at`). Події, записані до цієї зміни, на графіку не видно (у них ingested_at = NULL).
+  - У другому прогоні новий brute-force з 203.0.113.99 на дашборді одразу Critical, хоча детектор дав High. Причина: агент бачив в історії IP успішний вхід admin після серії невдач з першого прогону (за 2 хв до того) і підвищив severity. Дашборд показує підсумкову severity, консоль live — детекторну.
+  - Перевірка "немає innerHTML" спіймала це слово в коментарі JS. Коментар перефразовано, перевірку не послаблено.
+  - Heredoc з Python-патчем знову зіпсував `\n`, тому правки main.py зроблено через Edit.
+  - `test_live.py` з виводом у файл падає на кодуванні cp1251 (рамки rich). З `PYTHONIOENCODING=utf-8` проходить; це не пов'язано з дашбордом.
+- Файли: `dashboard.py`, `dashboard.html`, `test_dashboard.py` (створено); `history.py`, `main.py`, `requirements.txt`, `.gitignore`, `PROJECT_BRIEF.md`, `NOTES.md` (змінено)

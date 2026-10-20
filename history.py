@@ -6,10 +6,16 @@
 
 Повторне завантаження тих самих логів не дублює події: унікальність за
 (source_ip, timestamp, raw).
+
+Таблиця incidents — інциденти разом з висновками AI-агента (пишуть main.py
+batch і live, читає dashboard.py). Інцидент = (rule, source_ip, first_seen);
+повторний запис оновлює кількість подій і severity, а висновок агента
+замінюється лише новим висновком (запис без AI його не стирає).
 """
 
 import json
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 
 DEFAULT_DB = Path(__file__).parent / "history.db"
@@ -26,16 +32,56 @@ CREATE TABLE IF NOT EXISTS events (
     event_type  TEXT NOT NULL,
     raw         TEXT NOT NULL,
     meta        TEXT NOT NULL,          -- JSON
+    ingested_at TEXT,                   -- місцевий час запису в базу (графік дашборду)
     UNIQUE (source_ip, timestamp, raw)
 );
 CREATE INDEX IF NOT EXISTS idx_events_ip_time ON events (source_ip, timestamp);
+
+CREATE TABLE IF NOT EXISTS incidents (
+    id                 INTEGER PRIMARY KEY,
+    rule               TEXT NOT NULL,
+    source_ip          TEXT NOT NULL,
+    log_source         TEXT NOT NULL,
+    severity           TEXT NOT NULL,   -- підсумкова: не нижче ні детектора, ні агента
+    detector_severity  TEXT NOT NULL,
+    agent_severity     TEXT,            -- NULL, якщо AI-аналізу не було
+    severity_note      TEXT,
+    threat_type        TEXT,
+    explanation        TEXT,
+    recommendation     TEXT,
+    tool_calls         TEXT,            -- JSON: [{name, args, result}, ...]
+    model              TEXT,            -- провайдер/модель агента
+    details            TEXT NOT NULL,   -- JSON від правила детектора
+    examples           TEXT NOT NULL,   -- JSON: сирі рядки логу
+    first_seen         TEXT NOT NULL,
+    last_seen          TEXT NOT NULL,
+    event_count        INTEGER NOT NULL,
+    detected_at        TEXT NOT NULL,   -- місцевий час першого запису
+    updated_at         TEXT NOT NULL,
+    UNIQUE (rule, source_ip, first_seen)
+);
 """
+
+SEVERITIES = ["Low", "Medium", "High", "Critical"]
+
+
+def _max_severity(*severities: str | None) -> str:
+    return max((s for s in severities if s in SEVERITIES), key=SEVERITIES.index)
+
+
+def now() -> str:
+    return datetime.now().isoformat(timespec="seconds")
 
 
 class History:
     def __init__(self, path: str | Path = DEFAULT_DB):
-        self.conn = sqlite3.connect(str(path))
+        self.conn = sqlite3.connect(str(path), timeout=10)
+        # WAL: дашборд читає базу, поки live у неї пише, і не блокує запис
+        self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(events)")}
+        if "ingested_at" not in columns:  # база, створена до появи дашборду
+            self.conn.execute("ALTER TABLE events ADD COLUMN ingested_at TEXT")
 
     def close(self) -> None:
         self.conn.close()
@@ -50,13 +96,65 @@ class History:
         """Зберігає події; повертає кількість нових (дублікати пропускаються)."""
         before = self.conn.total_changes
         self.conn.executemany(
-            "INSERT OR IGNORE INTO events (timestamp, source_ip, log_source, event_type, raw, meta) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO events (timestamp, source_ip, log_source, event_type, raw, meta, ingested_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             [(e["timestamp"], e["source_ip"], e["log_source"], e["event_type"], e["raw"],
-              json.dumps(e.get("meta", {}), ensure_ascii=False)) for e in events],
+              json.dumps(e.get("meta", {}), ensure_ascii=False), now()) for e in events],
         )
         self.conn.commit()
         return self.conn.total_changes - before
+
+    def store_incident(self, incident: dict, analysis: dict | None = None) -> int:
+        """Записує інцидент детектора (+ висновок агента, якщо є); повертає id рядка.
+
+        Той самий інцидент (rule, source_ip, first_seen) оновлюється: кількість
+        подій і last_seen не зменшуються, severity не знижується. Без analysis
+        попередній висновок агента залишається.
+        """
+        key = (incident["rule"], incident["source_ip"], incident["first_seen"])
+        row = self.conn.execute(
+            "SELECT id, detector_severity, agent_severity, event_count, last_seen FROM incidents "
+            "WHERE rule = ? AND source_ip = ? AND first_seen = ?", key).fetchone()
+        examples = [e["raw"] for e in incident.get("examples", [])]
+        fields = {
+            "log_source": incident["examples"][0]["log_source"] if incident.get("examples") else "?",
+            "detector_severity": incident["severity"],
+            "details": json.dumps(incident.get("details", {}), ensure_ascii=False, default=str),
+            "examples": json.dumps(examples, ensure_ascii=False),
+            "last_seen": incident["last_seen"],
+            "event_count": incident["event_count"],
+            "updated_at": now(),
+        }
+        if analysis is not None:
+            fields.update({
+                "agent_severity": analysis["severity"],
+                "severity_note": analysis.get("severity_note"),
+                "threat_type": analysis.get("threat_type"),
+                "explanation": analysis.get("explanation"),
+                "recommendation": analysis.get("recommendation"),
+                "tool_calls": json.dumps(analysis.get("tool_calls", []), ensure_ascii=False, default=str),
+                "model": f"{analysis.get('provider')}/{analysis.get('model')}",
+            })
+
+        if row is None:
+            fields.update(zip(("rule", "source_ip", "first_seen"), key))
+            fields["detected_at"] = fields["updated_at"]
+            fields["severity"] = _max_severity(fields["detector_severity"], fields.get("agent_severity"))
+            cur = self.conn.execute(
+                f"INSERT INTO incidents ({', '.join(fields)}) VALUES ({', '.join('?' * len(fields))})",
+                list(fields.values()))
+            self.conn.commit()
+            return cur.lastrowid
+
+        row_id, old_detector, old_agent, old_count, old_last = row
+        fields["detector_severity"] = _max_severity(old_detector, fields["detector_severity"])
+        fields["event_count"] = max(old_count, fields["event_count"])
+        fields["last_seen"] = max(old_last, fields["last_seen"])
+        fields["severity"] = _max_severity(fields["detector_severity"], fields.get("agent_severity", old_agent))
+        self.conn.execute(f"UPDATE incidents SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ?",
+                          [*fields.values(), row_id])
+        self.conn.commit()
+        return row_id
 
     def ip_summary(self, ip: str) -> dict:
         """Зведення по IP. Для IP, якого немає в базі, total_events = 0, а дати — None."""

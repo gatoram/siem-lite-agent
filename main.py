@@ -22,6 +22,9 @@
 Формат кожного файлу (ssh / web / firewall) визначається автоматично за першими
 рядками, тому порядок аргументів не важливий.
 
+Інциденти разом з висновками агента пишуться в таблицю incidents тієї ж
+бази — її показує веб-дашборд (py -3 dashboard.py).
+
 У live нові рядки парсяться, пишуться в history.db, а детектор щоразу
 працює по ковзному вікну останніх подій (live.WINDOW). Кожен новий інцидент
 (IP + правило + first_seen) AI-агент аналізує один раз, хоч би скільки атака
@@ -328,6 +331,10 @@ def run_batch(args: argparse.Namespace) -> int:
             console.print(f"\nAI-агент проаналізував {len(analyses)} з {len(incidents)} інцидентів"
                           + (" [dim](dry-run)[/dim]" if args.dry_run else ""))
 
+        # Для дашборду: інциденти з висновками агента
+        for n, incident in enumerate(incidents, 1):
+            db.store_incident(incident, analyses.get(n))
+
         if args.notify:
             console.print()
             run_notify(incidents, analyses, dry_run=args.dry_run, db=db)
@@ -392,6 +399,9 @@ class LiveSession:
         self.window.add(events)
         for n, incident, kind in self.tracker.update(detector.detect(self.window.events)):
             self.on_incident(n, incident, kind)
+        # Дашборд бачить, як інциденти ростуть (кількість подій, last_seen), а не лише момент появи
+        for incident in self.tracker.all():
+            self.db.store_incident(incident)
         return len(events)
 
     def on_incident(self, n: int, incident: dict, kind: str) -> None:
@@ -408,6 +418,7 @@ class LiveSession:
                 analysis = self.analyze(n, incident)
         if analysis is None:
             print_detector_panel(n, incident)
+        self.db.store_incident(incident, analysis)
 
         if self.sent_log is not None:
             stats = notifier.notify([(incident, analysis)], self.sent_log, dry_run=self.args.dry_run,

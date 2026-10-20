@@ -3,6 +3,8 @@
 
 # Локальна база історії по IP
 history.db
+history.db-wal
+history.db-shm
 
 # Python
 __pycache__/

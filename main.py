@@ -20,7 +20,9 @@
 (без дублікатів між запусками); --dry-run друкує сповіщення замість відправки.
 
 Формат кожного файлу (ssh / web / firewall) визначається автоматично за першими
-рядками, тому порядок аргументів не важливий.
+рядками, тому порядок аргументів не важливий. Якщо на початку файлу лише
+нерозпізнаний шум (CRON, pam_unix, sudo в реальному auth.log), файл
+переглядається далі до першого розпізнаного рядка.
 
 Інциденти разом з висновками агента пишуться в таблицю incidents тієї ж
 бази — її показує веб-дашборд (py -3 dashboard.py).
@@ -60,6 +62,11 @@ from parsers import firewall_parser, ssh_parser, web_parser
 
 # Скільки перших непорожніх рядків дивитися, щоб визначити формат файлу
 DETECT_SAMPLE_LINES = 20
+# Якщо серед перших DETECT_SAMPLE_LINES жоден рядок не розпізнано (реальний
+# /var/log/auth.log: CRON, pam_unix, sudo, а sshd трапляється рідко), файл
+# переглядається далі — до першого розпізнаного рядка, але не більше стількох
+# непорожніх рядків (≈ десятки МБ, кілька секунд на найгірший випадок)
+DETECT_MAX_LINES = 200_000
 
 SEVERITY_STYLE = {
     "Critical": "bold white on red",
@@ -81,14 +88,29 @@ def get_parsers(year: int | None) -> dict[str, Callable[[str], dict | None]]:
 
 
 def detect_format(path: Path, parsers: dict[str, Callable]) -> str | None:
-    """Обирає парсер, який розпізнав найбільше з перших рядків файлу."""
+    """Визначає формат файлу (назву парсера) або None.
+
+    1. Перші DETECT_SAMPLE_LINES непорожніх рядків: обирається парсер, що
+       розпізнав найбільше з них.
+    2. Якщо жоден з них не розпізнано (системний шум на початку файлу) —
+       скан далі, до DETECT_MAX_LINES непорожніх рядків: формат визначає
+       перший рядок, який розпізнав будь-який парсер.
+    None — лише якщо в переглянутій частині файлу немає жодного збігу.
+    """
     with open(path, encoding="utf-8", errors="replace") as f:
-        sample = list(islice((line for line in f if line.strip()), DETECT_SAMPLE_LINES))
-    if not sample:
-        return None
-    scores = {name: sum(parse(line) is not None for line in sample) for name, parse in parsers.items()}
-    best = max(scores, key=scores.get)
-    return best if scores[best] > 0 else None
+        lines = (line for line in f if line.strip())
+        sample = list(islice(lines, DETECT_SAMPLE_LINES))
+        if not sample:
+            return None
+        scores = {name: sum(parse(line) is not None for line in sample) for name, parse in parsers.items()}
+        best = max(scores, key=scores.get)
+        if scores[best] > 0:
+            return best
+        for line in islice(lines, DETECT_MAX_LINES - len(sample)):
+            for name, parse in parsers.items():
+                if parse(line) is not None:
+                    return name
+    return None
 
 
 def load_events(paths: list[Path], year: int | None) -> tuple[list[dict], list[dict]]:

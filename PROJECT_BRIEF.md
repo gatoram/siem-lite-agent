@@ -140,8 +140,12 @@ spt, interface, dst, action (префікс LOG-правила, напр. `UFW B
    готового файлу — для тестування й демо).
 
    Batch (реалізовано): `py -3 main.py batch sample_logs/auth.log sample_logs/access.log sample_logs/firewall.log`.
-   Формат кожного файлу (ssh / web / firewall) визначається автоматично за першими
-   рядками; результат — таблиця інцидентів у консолі (`rich`) з кольором
+   Формат кожного файлу (ssh / web / firewall) визначається автоматично
+   (`main.detect_format`): за першими `DETECT_SAMPLE_LINES` (20) рядками, а якщо
+   серед них немає жодного розпізнаного (реальний `/var/log/auth.log` — це
+   переважно CRON, pam_unix, sudo) — файл переглядається далі, до першого
+   розпізнаного рядка (не більше `DETECT_MAX_LINES`, 200 000 рядків); "формат
+   не розпізнано" — лише якщо збігу немає взагалі. Результат — таблиця інцидентів у консолі (`rich`) з кольором
    severity і підсумком.
 
    Live (реалізовано): `py -3 main.py live live_logs/auth.log live_logs/access.log --ai --notify`.

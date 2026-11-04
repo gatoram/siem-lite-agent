@@ -9,6 +9,7 @@
 
 import json
 import sys
+import tempfile
 from collections import Counter
 from pathlib import Path
 
@@ -86,6 +87,7 @@ def main() -> None:
     check_firewall_formats()
     check_real_ssh_log()
     check_ubuntu_2404_format()
+    check_format_detection_with_noise()
 
     print("\nУсі перевірки пройдено.")
 
@@ -231,6 +233,72 @@ def check_ubuntu_2404_format() -> None:
     for event in (ssh, fw):
         print(f"  {event['log_source']:<8} {event['event_type']:<14} {event['timestamp']}  "
               f"{event['source_ip']}")
+
+
+# Системний шум реального /var/log/auth.log (Ubuntu 24.04), який жоден парсер не
+# розпізнає — включно з рядками sshd-session, що не є спробою входу
+AUTH_LOG_NOISE = [
+    "2026-11-04T20:17:01.123456+00:00 UbuntuTestSiem CRON[{n}]: pam_unix(cron:session): session opened for user root(uid=0) by root(uid=0)",
+    "2026-11-04T20:17:01.130000+00:00 UbuntuTestSiem CRON[{n}]: pam_unix(cron:session): session closed for user root",
+    "2026-11-04T20:20:44.000001+00:00 UbuntuTestSiem sudo:     siem : TTY=pts/0 ; PWD=/home/siem ; USER=root ; COMMAND=/usr/bin/tail -f /var/log/auth.log",
+    "2026-11-04T20:20:44.000002+00:00 UbuntuTestSiem sudo: pam_unix(sudo:session): session opened for user root(uid=0) by siem(uid=1000)",
+    "2026-11-04T20:21:00.000000+00:00 UbuntuTestSiem systemd-logind[{n}]: New session 7 of user siem.",
+    "2026-11-04T20:58:00.100000+00:00 UbuntuTestSiem sshd-session[{n}]: Invalid user admin from 192.168.147.5 port 50940",
+    "2026-11-04T20:58:00.200000+00:00 UbuntuTestSiem sshd-session[{n}]: pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=192.168.147.5",
+]
+
+
+def check_format_detection_with_noise() -> None:
+    """main.detect_format: шум на початку файлу не заважає визначити формат."""
+    import main as siem
+
+    parsers = siem.get_parsers(None)
+    noise_count = siem.DETECT_SAMPLE_LINES * 3  # шуму більше, ніж перша вибірка
+    noise = [AUTH_LOG_NOISE[i % len(AUTH_LOG_NOISE)].format(n=1000 + i) for i in range(noise_count)]
+    ssh_lines = [UBUNTU_SSH_FAIL, UBUNTU_SSH_FAIL.replace("50940", "50941")]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+
+        def write(name: str, lines: list[str]) -> Path:
+            path = tmp / name
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            return path
+
+        # Перші DETECT_SAMPLE_LINES — лише шум, SSH-рядки далі, вперемішку з шумом
+        auth = write("auth.log", noise + ssh_lines[:1] + noise[:5] + ssh_lines[1:])
+        assert all(parse(line) is None for line in noise for parse in parsers.values())
+        assert siem.detect_format(auth, parsers) == "ssh"
+        # batch бере з такого файлу саме SSH-події, а шум рахує нерозпізнаним
+        events, stats = siem.load_events([auth], None)
+        assert [e["source_ip"] for e in events] == ["192.168.147.5"] * 2
+        assert stats[0]["format"] == "ssh" and stats[0]["lines"] == noise_count + 5 + 2
+
+        # Те саме для ufw.log: блокування після шуму ядра
+        fw = write("ufw.log", [f"2026-11-04T20:55:{i % 60:02d}+00:00 UbuntuTestSiem kernel: eth0: link up"
+                               for i in range(noise_count)] + [UBUNTU_UFW_BLOCK])
+        assert siem.detect_format(fw, parsers) == "firewall"
+
+        # Лише шум у всьому файлі — формат не розпізнано
+        assert siem.detect_format(write("noise.log", noise), parsers) is None
+        events, stats = siem.load_events([tmp / "noise.log"], None)
+        assert events == [] and stats[0]["format"] == "?"
+
+        # Розпізнаний рядок за межею DETECT_MAX_LINES не шукається (скан обмежений)
+        old_max = siem.DETECT_MAX_LINES
+        siem.DETECT_MAX_LINES = noise_count
+        try:
+            assert siem.detect_format(auth, parsers) is None
+        finally:
+            siem.DETECT_MAX_LINES = old_max
+
+        # Звичайний випадок не змінився: розпізнавані рядки на початку
+        assert siem.detect_format(LOGS_DIR / "auth.log", parsers) == "ssh"
+        assert siem.detect_format(LOGS_DIR / "access.log", parsers) == "web"
+        assert siem.detect_format(LOGS_DIR / "firewall.log", parsers) == "firewall"
+
+    print(f"\nАвтовизначення формату: {noise_count} рядків шуму на початку auth.log — формат ssh, "
+          f"2 події; файл лише з шуму — не розпізнано")
 
 
 if __name__ == "__main__":

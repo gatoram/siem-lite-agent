@@ -339,3 +339,58 @@ parsers/web_parser.py, що перетворюють рядки з sample_logs �
   - Heredoc з Python-патчем знову зіпсував `\n`, тому правки main.py зроблено через Edit.
   - `test_live.py` з виводом у файл падає на кодуванні cp1251 (рамки rich). З `PYTHONIOENCODING=utf-8` проходить; це не пов'язано з дашбордом.
 - Файли: `dashboard.py`, `dashboard.html`, `test_dashboard.py` (створено); `history.py`, `main.py`, `requirements.txt`, `.gitignore`, `PROJECT_BRIEF.md`, `NOTES.md` (змінено)
+
+## [2026-11-04] Підтримка формату логів Ubuntu 24.04 (ISO 8601, sshd-session)
+- Промпт:
+```
+Треба додати підтримку реального формату логів Ubuntu 24.04 (новий rsyslog),
+не зламавши наявні тести на старому форматі.
+
+Реальні приклади рядків з Ubuntu:
+
+auth.log (SSH fail):
+2026-11-04T20:58:02.245641+00:00 UbuntuTestSiem sshd-session[9621]: Failed password for invalid user admin from 192.168.147.5 port 50940 ssh2
+
+ufw.log (firewall block):
+2026-11-04T20:55:20.400557+00:00 UbuntuTestSiem kernel: [UFW BLOCK] IN=enp0s3 OUT= MAC=... SRC=34.107.243.93 DST=10.0.2.15 LEN=64 PROTO=TCP SPT=443 DPT=54516 WINDOW=65535
+
+Дві відмінності від старого формату:
+1. Час тепер ISO 8601 з часовим поясом (2026-11-04T20:58:02.245641+00:00),
+   а не старий syslog (Sep 30 03:22:14)
+2. Процес зветься sshd-session[PID], а не sshd[PID]
+
+Що зроби:
+- Навчи ssh_parser і firewall_parser розпізнавати ОБИДВА формати часу:
+  і старий (Sep 30 ...), і новий ISO 8601. Визначай формат автоматично
+  по рядку, парсер не повинен вимагати прапорця
+- ssh_parser має приймати і sshd[PID], і sshd-session[PID]
+- Новий формат уже містить рік, тому для нього параметр year не потрібен;
+  для старого лишається як було
+- Додай реальні рядки Ubuntu у тести (test_parsers.py), щоб обидва формати
+  були під перевіркою. Старі синтетичні тести мають і далі проходити
+- Онови PROJECT_BRIEF.md і NOTES.md
+
+Протестуй: прожени всі тести, покажи що старі й нові формати парсяться.
+```
+- Що зроблено:
+  - Новий спільний модуль `parsers/syslog_time.py`: регулярний вираз часу з
+    двома альтернативами (ISO 8601 з поясом або старий `Sep 30 03:22:14`) і
+    `parse_header_timestamp`; формат визначається по кожному рядку. Стара
+    функція розбору часу перенесена сюди з `ssh_parser`.
+  - `ssh_parser` приймає `sshd[PID]` і `sshd-session[PID]` (ім'я процесу в
+    `meta.process`), `firewall_parser` — ISO-час. Для ISO рік береться з рядка
+    (`year` ігнорується), час переводиться в UTC, мікросекунди зберігаються.
+  - `test_parsers.py`: `check_ubuntu_2404_format()` з реальними рядками Ubuntu
+    (SSH fail, ufw block) + Accepted, інший пояс (+02:00 → UTC), message
+    repeated, змішані комбінації, перевірка що sshd/ufw/web-парсери не
+    плутають рядки один одного.
+  - Прогнано всі 7 тестів (parsers, detector, history, agent, notifier, live,
+    dashboard) — проходять; `main.py batch` на файлах у новому форматі
+    автоматично визначає ssh/firewall і знаходить brute_force і port_scanning.
+- Проблеми і як вирішено:
+  - Часовий пояс: решта подій зберігається без поясу. Для ISO-рядків час
+    переводиться в UTC, як уже робить web_parser, — тоді SSH/firewall з
+    Ubuntu 24.04 і web на одній шкалі. Старий формат лишився в місцевому часі
+    (поясу в рядку немає).
+- Файли: `parsers/syslog_time.py` (новий), `parsers/ssh_parser.py`,
+  `parsers/firewall_parser.py`, `test_parsers.py`, `PROJECT_BRIEF.md`, `NOTES.md`

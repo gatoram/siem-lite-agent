@@ -63,6 +63,16 @@ spt, interface, dst, action (префікс LOG-правила, напр. `UFW B
    Failed/Accepted, включно з `message repeated N times: [...]` (одна подія з
    `meta.repeated = N`; детектор і історія рахують її як N спроб).
 
+   Формат syslog-рядка (SSH і firewall) визначається автоматично по кожному
+   рядку, без прапорців (спільний модуль `parsers/syslog_time.py`):
+   - старий (RFC 3164, Loghub, синтетичні логи): `Sep 30 03:22:14 host sshd[PID]: ...`
+     — року немає, береться з `--year` / параметра `year`, час місцевий;
+   - Ubuntu 24.04+ (rsyslog за замовчуванням): `2026-11-04T20:58:02.245641+00:00
+     host sshd-session[PID]: ...` — ISO 8601 з поясом, рік у рядку (`year`
+     ігнорується), час переводиться в UTC (як у web), мікросекунди
+     зберігаються. Процес `sshd-session` (OpenSSH 9.8+) приймається нарівні
+     з `sshd` і пишеться в `meta.process`.
+
 3. **Rule-based детектор** (`detector.py`) — правила на першому етапі:
    - brute-force: N невдалих логінів за M хвилин з одного IP (SSH); якщо
      після серії з того ж IP був успішний вхід — severity Critical

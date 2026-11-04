@@ -1,7 +1,13 @@
 """Парсер SSH auth.log (syslog-формат sshd) в уніфікований формат події.
 
-Приклад рядка:
+Приклади рядків (формат визначається автоматично по кожному рядку):
   Sep 30 03:22:14 srv-web01 sshd[1234]: Failed password for invalid user test from 203.0.113.45 port 51234 ssh2
+  2026-11-04T20:58:02.245641+00:00 UbuntuTestSiem sshd-session[9621]: Failed password for invalid user admin from 192.168.147.5 port 50940 ssh2
+
+Другий — Ubuntu 24.04+: rsyslog пише час в ISO 8601 з часовим поясом, а
+OpenSSH 9.8+ веде сесію в окремому процесі sshd-session. Приймаються обидва
+імена процесу (sshd і sshd-session) з обома форматами часу. Розбір часу —
+у parsers/syslog_time.py.
 
 Розпізнаються лише спроби входу (Accepted / Failed). Решта рядків sshd
 (pam_unix, "Invalid user", disconnect, "POSSIBLE BREAK-IN ATTEMPT" тощо)
@@ -16,20 +22,23 @@
   - ім'я користувача може починатися з пробілу ("invalid user  0101").
   - метод може бути "none" (Failed none for invalid user ...).
 
-У syslog-форматі немає року. Парсер підставляє рік явно (параметр `year`),
-а якщо його не задано — поточний рік. Якщо при цьому дата опиняється в
-майбутньому (лог за грудень читається в січні), береться попередній рік.
+У старому syslog-форматі немає року. Парсер підставляє рік явно (параметр
+`year`), а якщо його не задано — поточний рік. Якщо при цьому дата
+опиняється в майбутньому (лог за грудень читається в січні), береться
+попередній рік. Для ISO 8601 рік є в рядку, `year` не потрібен і
+ігнорується; час переводиться в UTC.
 """
 
 import re
-from datetime import datetime, timedelta
 from pathlib import Path
+
+from parsers.syslog_time import TIMESTAMP_PATTERN, parse_header_timestamp
 
 LOG_SOURCE = "ssh"
 
 SYSLOG_RE = re.compile(
-    r"^(?P<month>\w{3})\s+(?P<day>\d{1,2})\s+(?P<time>\d{2}:\d{2}:\d{2})\s+"
-    r"(?P<host>\S+)\s+sshd\[(?P<pid>\d+)\]:\s+(?P<message>.*)$"
+    rf"^{TIMESTAMP_PATTERN}\s+"
+    r"(?P<host>\S+)\s+(?P<process>sshd(?:-session)?)\[(?P<pid>\d+)\]:\s+(?P<message>.*)$"
 )
 # "message repeated N times: [ <оригінальне повідомлення>]"
 REPEATED_RE = re.compile(r"^message repeated (?P<count>\d+) times: \[\s*(?P<message>.*?)\s*\]$")
@@ -40,20 +49,6 @@ FAILED_RE = re.compile(
     r"^Failed (?P<method>\S+) for (?P<invalid>invalid user\s+)?(?P<user>\S+) "
     r"from (?P<ip>\S+) port (?P<port>\d+)"
 )
-
-# Допуск на розбіжність годинників, перш ніж вважати дату "майбутньою"
-FUTURE_TOLERANCE = timedelta(days=1)
-
-
-def _parse_timestamp(month: str, day: str, time: str, year: int | None) -> datetime:
-    explicit_year = year is not None
-    if year is None:
-        year = datetime.now().year
-    ts = datetime.strptime(f"{year} {month} {day} {time}", "%Y %b %d %H:%M:%S")
-    if not explicit_year and ts > datetime.now() + FUTURE_TOLERANCE:
-        ts = ts.replace(year=year - 1)
-    return ts
-
 
 def parse_line(line: str, year: int | None = None) -> dict | None:
     line = line.rstrip("\r\n")
@@ -76,7 +71,7 @@ def parse_line(line: str, year: int | None = None) -> dict | None:
         return None
 
     event = {
-        "timestamp": _parse_timestamp(header["month"], header["day"], header["time"], year).isoformat(),
+        "timestamp": parse_header_timestamp(header, year).isoformat(),
         "source_ip": m["ip"],
         "log_source": LOG_SOURCE,
         "event_type": event_type,
@@ -88,6 +83,7 @@ def parse_line(line: str, year: int | None = None) -> dict | None:
             "port": int(m["port"]),
             "host": header["host"],
             "pid": int(header["pid"]),
+            "process": header["process"],
         },
     }
     if repeated > 1:

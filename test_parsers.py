@@ -85,6 +85,7 @@ def main() -> None:
 
     check_firewall_formats()
     check_real_ssh_log()
+    check_ubuntu_2404_format()
 
     print("\nУсі перевірки пройдено.")
 
@@ -163,6 +164,73 @@ def check_real_ssh_log() -> None:
     assert len(events) == auth_lines == 525
     assert counts == {"login_fail": 524, "login_success": 1}
     assert sum(e["meta"].get("repeated", 1) for e in events) == 533
+
+
+# Реальні рядки з Ubuntu 24.04 (rsyslog за замовчуванням: ISO 8601 з поясом,
+# OpenSSH 9.8+: процес sshd-session)
+UBUNTU_SSH_FAIL = ("2026-11-04T20:58:02.245641+00:00 UbuntuTestSiem sshd-session[9621]: "
+                   "Failed password for invalid user admin from 192.168.147.5 port 50940 ssh2")
+UBUNTU_UFW_BLOCK = ("2026-11-04T20:55:20.400557+00:00 UbuntuTestSiem kernel: [UFW BLOCK] IN=enp0s3 "
+                    "OUT= MAC=... SRC=34.107.243.93 DST=10.0.2.15 LEN=64 PROTO=TCP SPT=443 "
+                    "DPT=54516 WINDOW=65535")
+
+
+def check_ubuntu_2404_format() -> None:
+    """Новий формат rsyslog з Ubuntu 24.04 поряд зі старим, без прапорців."""
+    # SSH: ISO-час, sshd-session; year не потрібен
+    ssh = ssh_parser.parse_line(UBUNTU_SSH_FAIL)
+    assert ssh is not None, "рядок Ubuntu 24.04 (sshd-session) не розпізнано"
+    assert ssh["event_type"] == "login_fail"
+    assert ssh["source_ip"] == "192.168.147.5"
+    assert ssh["timestamp"] == "2026-11-04T20:58:02.245641"
+    assert ssh["meta"]["user"] == "admin" and ssh["meta"]["invalid_user"]
+    assert ssh["meta"]["port"] == 50940 and ssh["meta"]["pid"] == 9621
+    assert ssh["meta"]["host"] == "UbuntuTestSiem"
+    assert ssh["meta"]["process"] == "sshd-session"
+    # Рік з рядка важливіший за параметр year
+    assert ssh_parser.parse_line(UBUNTU_SSH_FAIL, year=2020)["timestamp"].startswith("2026-")
+    # Успішний вхід у новому форматі
+    ok = ssh_parser.parse_line(
+        "2026-11-04T21:00:00.000001+00:00 UbuntuTestSiem sshd-session[9700]: "
+        "Accepted password for siem from 192.168.147.5 port 50999 ssh2")
+    assert ok["event_type"] == "login_success" and ok["meta"]["user"] == "siem"
+    # Інший часовий пояс переводиться в UTC (як у web_parser)
+    kyiv = ssh_parser.parse_line(UBUNTU_SSH_FAIL.replace("20:58:02.245641+00:00", "22:58:02.245641+02:00"))
+    assert kyiv["timestamp"] == "2026-11-04T20:58:02.245641"
+    # "message repeated" теж працює в новому форматі
+    rep = ssh_parser.parse_line(
+        "2026-11-04T20:58:10.000000+00:00 UbuntuTestSiem sshd-session[9621]: message repeated 3 times: "
+        "[ Failed password for invalid user admin from 192.168.147.5 port 50940 ssh2]")
+    assert rep["meta"]["repeated"] == 3
+    # Старий формат з sshd-session і новий з sshd — комбінації теж приймаються
+    assert ssh_parser.parse_line(
+        "Nov  4 20:58:02 host sshd-session[1]: Failed password for root from 1.2.3.4 port 1 ssh2",
+        year=2026)["timestamp"] == "2026-11-04T20:58:02"
+    assert ssh_parser.parse_line(
+        "2026-11-04T20:58:02+00:00 host sshd[1]: Failed password for root from 1.2.3.4 port 1 ssh2"
+    )["timestamp"] == "2026-11-04T20:58:02"
+    # Інші процеси з префіксом sshd не підхоплюються
+    assert ssh_parser.parse_line(
+        "2026-11-04T20:58:02+00:00 host sshd-foo[1]: Failed password for root from 1.2.3.4 port 1 ssh2") is None
+
+    # Firewall: ISO-час, без мітки uptime ядра
+    fw = firewall_parser.parse_line(UBUNTU_UFW_BLOCK)
+    assert fw is not None, "рядок Ubuntu 24.04 (ufw) не розпізнано"
+    assert fw["event_type"] == "firewall_block"
+    assert fw["source_ip"] == "34.107.243.93"
+    assert fw["timestamp"] == "2026-11-04T20:55:20.400557"
+    assert fw["meta"] == {"action": "UFW BLOCK", "proto": "TCP", "dpt": 54516, "spt": 443,
+                          "interface": "enp0s3", "dst": "10.0.2.15", "host": "UbuntuTestSiem"}
+
+    # Автовизначення формату файлу в main.py не плутає джерела і в новому форматі
+    assert firewall_parser.parse_line(UBUNTU_SSH_FAIL) is None
+    assert ssh_parser.parse_line(UBUNTU_UFW_BLOCK) is None
+    assert web_parser.parse_line(UBUNTU_SSH_FAIL) is None
+
+    print("\nUbuntu 24.04 (ISO 8601 + sshd-session):")
+    for event in (ssh, fw):
+        print(f"  {event['log_source']:<8} {event['event_type']:<14} {event['timestamp']}  "
+              f"{event['source_ip']}")
 
 
 if __name__ == "__main__":
